@@ -1,1 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#07111f">
+  <title>Dharmrajsinh Live Market</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="app-shell">
+    <header class="hero">
+      <div class="brand-icon">📈</div>
+      <div>
+        <h1>Dharmrajsinh Live Market</h1>
+        <p>NSE • BSE • NIFTY 50 • SENSEX • MIDCPNIFTY • INDIA VIX</p>
+      </div>
+    </header>
 
+    <section class="status-card">
+      <div>
+        <span class="eyebrow">MARKET STATUS</span>
+        <strong id="marketStatus">Loading...</strong>
+        <small id="lastUpdate">Checking...</small>
+      </div>
+      <div class="live-dot" id="liveDot">●</div>
+    </section>
+
+    <section class="index-panel">
+      <div class="section-title">
+        <h2>📊 Live Market Indices</h2>
+        <span id="indexUpdated">--</span>
+      </div>
+      <div id="indexes" class="index-grid">
+        <div class="loading-card">Loading NIFTY / SENSEX / MIDCPNIFTY / INDIA VIX...</div>
+      </div>
+    </section>
+
+    <section class="search-panel">
+      <div class="search-row">
+        <input id="search" type="search" autocomplete="off" placeholder="Search stock e.g. RELIANCE, TCS, INFY">
+        <button id="searchButton" onclick="searchStock()">🔎 Search</button>
+      </div>
+      <div class="search-note">Search covers NSE + BSE equity instruments.</div>
+    </section>
+
+    <section id="result" class="result-area"></section>
+
+    <footer>
+      <span>Dharmrajsinh Live Market V7.4</span>
+      <span>Read-only analysis • Not an order execution system</span>
+    </footer>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
