@@ -1,5 +1,5 @@
 // ============================================================
-// DHARMRAJSINH LIVE MARKET V7.4 - FRONTEND
+// DHARMRAJSINH LIVE MARKET V7.4.1 - FRONTEND
 // ============================================================
 
 let selected = null;
@@ -7,6 +7,13 @@ let liveTimer = null;
 let statusTimer = null;
 let indexTimer = null;
 let liveBusy = false;
+
+// Search/live request guards prevent an older response from replacing
+// the stock that the user has just selected.
+let searchRequestId = 0;
+let liveRequestId = 0;
+let searchController = null;
+let liveController = null;
 
 window.searchResults = [];
 
@@ -49,9 +56,17 @@ function changeClass(value) {
   return n > 0 ? "positive" : n < 0 ? "negative" : "neutral";
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url, { cache: "no-store" });
-  const data = await response.json();
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, {
+    cache: "no-store",
+    ...options
+  });
+
+  const contentType = response.headers.get("content-type") || "";
+  const data = contentType.includes("application/json")
+    ? await response.json()
+    : { message: await response.text() };
+
   if (!response.ok) {
     const err = new Error(data.message || `HTTP ${response.status}`);
     err.status = response.status;
@@ -108,19 +123,56 @@ async function loadIndexes() {
 
 async function searchStock() {
   const input = document.getElementById("search");
+  const button = document.getElementById("searchButton");
   const query = input.value.trim();
-  if (!query) return;
 
+  if (!query) {
+    input.focus();
+    return;
+  }
+
+  // IMPORTANT: every new search is a new session.
+  // Stop the previous stock's refresh and invalidate old responses.
+  stopLiveTimer();
+  selected = null;
+  liveBusy = false;
+  liveRequestId++;
+  window.searchResults = [];
+
+  if (searchController) {
+    try { searchController.abort(); } catch (_) {}
+  }
+  searchController = new AbortController();
+
+  const requestId = ++searchRequestId;
   const result = document.getElementById("result");
-  result.innerHTML = `<div class="loading-card">🔎 Searching NSE + BSE for <strong>${escapeHtml(query)}</strong>...</div>`;
+
+  if (button) button.disabled = true;
+  result.innerHTML = `
+    <div class="loading-card">
+      🔎 Searching NSE + BSE for <strong>${escapeHtml(query)}</strong>...
+    </div>
+  `;
 
   try {
-    const data = await fetchJson(`/api/search?q=${encodeURIComponent(query)}`);
+    const data = await fetchJson(
+      `/api/search?q=${encodeURIComponent(query)}&_=${Date.now()}`,
+      { signal: searchController.signal }
+    );
+
+    // Ignore a response belonging to an older search.
+    if (requestId !== searchRequestId) return;
+
     const results = Array.isArray(data.results) ? data.results : [];
     window.searchResults = results;
 
     if (!results.length) {
-      result.innerHTML = `<div class="error-card">❌ No NSE/BSE equity instrument found for <strong>${escapeHtml(query)}</strong>.</div>`;
+      result.innerHTML = `
+        <div class="error-card">
+          ❌ No NSE/BSE equity instrument found for
+          <strong>${escapeHtml(query)}</strong>.
+        </div>
+      `;
       return;
     }
 
@@ -133,24 +185,63 @@ async function searchStock() {
               <strong>${escapeHtml(item.symbol)}</strong>
               <span class="badge">${escapeHtml(item.exchange || "EQ")}</span>
               <div>${escapeHtml(item.name)}</div>
-              <small>${escapeHtml(item.segment || "EQ")} • ${escapeHtml(item.isin || "")}</small>
+              <small>
+                ${escapeHtml(item.segment || "EQ")}
+                ${item.isin ? ` • ${escapeHtml(item.isin)}` : ""}
+              </small>
             </div>
-            <button class="analyze-btn" onclick="selectStock(${index})">📊 Analyze</button>
+            <button class="analyze-btn" onclick="selectStock(${index})">
+              📊 Analyze
+            </button>
           </div>
         `).join("")}
       </div>
     `;
   } catch (error) {
-    result.innerHTML = `<div class="error-card">⚠ Search error: ${escapeHtml(error.message)}</div>`;
+    if (error.name === "AbortError") return;
+    if (requestId !== searchRequestId) return;
+
+    result.innerHTML = `
+      <div class="error-card">
+        ⚠ Search error: ${escapeHtml(error.message)}
+      </div>
+    `;
+  } finally {
+    if (requestId === searchRequestId && button) {
+      button.disabled = false;
+    }
   }
 }
 
 function selectStock(index) {
   const item = window.searchResults[index];
-  if (!item?.instrument) return;
 
-  selected = item;
+  if (!item?.instrument) {
+    document.getElementById("result").innerHTML = `
+      <div class="error-card">❌ Selected stock instrument is unavailable.</div>
+    `;
+    return;
+  }
+
+  // Create a fresh object so a later search cannot mutate the active stock.
+  selected = {
+    symbol: item.symbol || "",
+    name: item.name || item.symbol || "",
+    exchange: item.exchange || "",
+    segment: item.segment || "EQ",
+    instrument: item.instrument,
+    isin: item.isin || "",
+    source: item.source || ""
+  };
+
   stopLiveTimer();
+
+  // Cancel an older live request and invalidate its response.
+  liveRequestId++;
+  if (liveController) {
+    try { liveController.abort(); } catch (_) {}
+  }
+
   loadLiveAnalysis();
   liveTimer = setInterval(loadLiveAnalysis, 5000);
 }
@@ -161,31 +252,85 @@ function selectStock(index) {
 
 async function loadLiveAnalysis() {
   if (!selected || liveBusy) return;
+
+  const activeInstrument = selected.instrument;
+  const activeSymbol = selected.symbol;
+  const requestId = ++liveRequestId;
+
   liveBusy = true;
 
+  if (liveController) {
+    try { liveController.abort(); } catch (_) {}
+  }
+  liveController = new AbortController();
+
   const result = document.getElementById("result");
+
   if (!document.querySelector(".analysis-card")) {
-    result.innerHTML = `<div class="loading-card">📡 Loading live analysis for <strong>${escapeHtml(selected.symbol)}</strong>...</div>`;
+    result.innerHTML = `
+      <div class="loading-card">
+        📡 Loading live analysis for
+        <strong>${escapeHtml(activeSymbol)}</strong>...
+      </div>
+    `;
   }
 
   try {
     const params = new URLSearchParams({
-      instrument: selected.instrument,
-      symbol: selected.symbol || "",
-      name: selected.name || selected.symbol || "",
+      instrument: activeInstrument,
+      symbol: activeSymbol || "",
+      name: selected.name || activeSymbol || "",
       exchange: selected.exchange || ""
     });
-    const response = await fetchJson(`/api/live?${params.toString()}`);
+
+    const response = await fetchJson(
+      `/api/live?${params.toString()}&_=${Date.now()}`,
+      { signal: liveController.signal }
+    );
+
+    // Never allow a late response for RELIANCE to overwrite TCS/INFY/etc.
+    if (
+      requestId !== liveRequestId ||
+      !selected ||
+      selected.instrument !== activeInstrument
+    ) {
+      return;
+    }
+
     renderAnalysis(response.data);
   } catch (error) {
+    if (error.name === "AbortError") return;
+
+    if (
+      requestId !== liveRequestId ||
+      !selected ||
+      selected.instrument !== activeInstrument
+    ) {
+      return;
+    }
+
     if (error.status === 401) {
-      result.innerHTML = `<div class="error-card">🔐 Upstox token expired/missing. Set <strong>UPSTOX_ACCESS_TOKEN</strong> on Render or use <a href="/login">Upstox Login</a>.</div>`;
+      result.innerHTML = `
+        <div class="error-card">
+          🔐 Upstox token expired/missing. Set
+          <strong>UPSTOX_ACCESS_TOKEN</strong> on Render or use
+          <a href="/login">Upstox Login</a>.
+        </div>
+      `;
     } else {
       const existing = document.querySelector(".analysis-card");
-      if (!existing) result.innerHTML = `<div class="error-card">⚠ Live analysis error: ${escapeHtml(error.message)}</div>`;
+      if (!existing) {
+        result.innerHTML = `
+          <div class="error-card">
+            ⚠ Live analysis error: ${escapeHtml(error.message)}
+          </div>
+        `;
+      }
     }
   } finally {
-    liveBusy = false;
+    if (requestId === liveRequestId) {
+      liveBusy = false;
+    }
   }
 }
 
@@ -343,7 +488,10 @@ function renderAnalysis(data) {
 // ============================================================
 
 document.getElementById("search")?.addEventListener("keydown", event => {
-  if (event.key === "Enter") searchStock();
+  if (event.key === "Enter") {
+    event.preventDefault();
+    searchStock();
+  }
 });
 
 function stopLiveTimer() {
