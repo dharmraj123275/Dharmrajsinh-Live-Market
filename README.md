@@ -1,4 +1,4 @@
-# Dharmrajsinh Live Market V7.4
+# Dharmrajsinh Live Market V7.4.1
 
 Mobile-first NSE + BSE equity analysis dashboard using the Upstox API.
 
@@ -62,3 +62,10 @@ The Upstox Market Data Feed V3 is the official streaming option if a true tick-b
 ## No order execution
 
 This version is an analysis/read-only dashboard. It does not place, modify or cancel orders.
+
+## V7.4.1 search fix
+
+- Each new search clears the previous selected instrument.
+- Older search/live responses cannot overwrite a newly selected stock.
+- Search results are ranked by exact symbol/name and deduplicated by instrument key.
+- NSE is shown before BSE when both are returned for the same query.
