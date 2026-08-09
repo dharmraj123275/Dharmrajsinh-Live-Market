@@ -40,7 +40,21 @@ function normalizeError(error) {
   return out;
 }
 
-async function request(base, path, params = {}) {
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isRetryable(error) {
+  // Retry on network/timeout errors and 5xx server errors, but never on
+  // 401 (bad/expired token) or other 4xx client errors — retrying those
+  // just wastes time and delays the "please login again" message.
+  const status = error?.response?.status;
+  if (!status) return true; // network error / timeout (no response received)
+  return status >= 500 && status < 600;
+}
+
+async function request(base, path, params = {}, attempt = 1) {
+  const MAX_ATTEMPTS = 3;
   try {
     return await axios.get(`${base}${path}`, {
       params,
@@ -48,6 +62,10 @@ async function request(base, path, params = {}) {
       timeout: 20000
     });
   } catch (error) {
+    if (attempt < MAX_ATTEMPTS && isRetryable(error)) {
+      await sleep(300 * attempt); // 300ms, 600ms backoff
+      return request(base, path, params, attempt + 1);
+    }
     throw normalizeError(error);
   }
 }
