@@ -339,7 +339,8 @@ function metric(title, value) {
 }
 
 function level(title, value) {
-  return `<div class="level"><span>${escapeHtml(title)}</span><strong>₹${formatNumber(value)}</strong></div>`;
+  const isText = typeof value === "string" && !/^[-+]?\d+(?:\.\d+)?$/.test(value.trim());
+  return `<div class="level"><span>${escapeHtml(title)}</span><strong>${isText ? escapeHtml(value) : `₹${formatNumber(value)}`}</strong></div>`;
 }
 
 function renderAnalysis(data) {
