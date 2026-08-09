@@ -746,33 +746,70 @@ async function getFundamentalAnalysis(instrument) {
 // ============================================================
 
 function calculateLevels({ price, support, resistance, atrValue, trend, technicalScore, depthTrend }) {
+  // V7.4.2: Intraday-safe level engine.
+  // Do not use a distant 20-day resistance as the immediate entry.
   const p = num(price);
   const atr = Math.max(num(atrValue), p * 0.004);
   const risk = Math.max(atr * 0.8, p * 0.006);
+  const minGap = Math.max(p * 0.001, atr * 0.05);
+  const maxEntryDistance = Math.max(p * 0.006, atr * 0.75);
 
-  let buyEntry = Math.max(p, resistance + Math.max(p * 0.001, atr * 0.05));
-  let buyStop = Math.max(0.01, Math.min(support, p - risk));
-  if (buyStop >= buyEntry) buyStop = Math.max(0.01, buyEntry - risk);
+  const s = num(support, p - risk);
+  const r = num(resistance, p + risk * 1.5);
 
-  let sellEntry = Math.min(p, support - Math.max(p * 0.001, atr * 0.05));
-  let sellStop = Math.max(sellEntry + risk, resistance);
+  // If resistance is far away, use a nearby breakout trigger instead of
+  // producing an unrealistic entry such as ₹1,614 on a ₹1,334 stock.
+  const rawBreakout = r > p ? r + minGap : p + minGap;
+  const buyEntry = p + Math.min(Math.max(rawBreakout - p, minGap), maxEntryDistance);
 
-  const buyRisk = Math.max(0.01, buyEntry - buyStop);
+  const buyStop = Math.max(0.01, Math.min(s, p - risk));
+  const safeBuyStop = buyStop >= buyEntry
+    ? Math.max(0.01, buyEntry - risk)
+    : buyStop;
+  const buyRisk = Math.max(0.01, buyEntry - safeBuyStop);
+
+  // Use a nearby resistance only when it provides a sensible reward.
+  // Otherwise calculate targets from the actual intraday risk distance.
+  const resistanceTarget = r > buyEntry ? r : 0;
+  const buyTarget1 = resistanceTarget > buyEntry &&
+      (resistanceTarget - buyEntry) >= buyRisk * 1.5
+    ? resistanceTarget
+    : buyEntry + buyRisk * 1.5;
+  const buyTarget2 = Math.max(
+    buyEntry + buyRisk * 2.0,
+    resistanceTarget > buyTarget1 ? resistanceTarget : 0
+  );
+
+  // Sell side: keep the trigger close to current price as well.
+  const rawBreakdown = s < p ? s - minGap : p - minGap;
+  const sellEntry = p - Math.min(Math.max(p - rawBreakdown, minGap), maxEntryDistance);
+  const sellStopBase = Math.max(sellEntry + risk, r);
+  const sellStop = sellStopBase <= sellEntry
+    ? sellEntry + risk
+    : sellStopBase;
   const sellRisk = Math.max(0.01, sellStop - sellEntry);
 
-  const buyTarget1 = buyEntry + buyRisk * 1.5;
-  const buyTarget2 = buyEntry + buyRisk * 2.0;
-  const sellTarget1 = Math.max(0.01, sellEntry - sellRisk * 1.5);
-  const sellTarget2 = Math.max(0.01, sellEntry - sellRisk * 2.0);
+  const supportTarget = s < sellEntry ? s : 0;
+  const sellTarget1 = supportTarget > 0 &&
+      (sellEntry - supportTarget) >= sellRisk * 1.5
+    ? supportTarget
+    : Math.max(0.01, sellEntry - sellRisk * 1.5);
+  const sellTarget2 = Math.min(
+    sellEntry - sellRisk * 2.0,
+    supportTarget > 0 && supportTarget < sellTarget1 ? supportTarget : sellEntry - sellRisk * 2.0
+  );
 
   const buyRR1 = (buyTarget1 - buyEntry) / buyRisk;
   const buyRR2 = (buyTarget2 - buyEntry) / buyRisk;
   const sellRR1 = (sellEntry - sellTarget1) / sellRisk;
   const sellRR2 = (sellEntry - sellTarget2) / sellRisk;
 
+  const breakoutLevel = buyEntry;
+  const breakdownLevel = sellEntry;
+
   return {
     buyEntry,
-    buyStop,
+    buyStop: safeBuyStop,
     buyTarget1,
     buyTarget2,
     buyRR1,
@@ -784,8 +821,8 @@ function calculateLevels({ price, support, resistance, atrValue, trend, technica
     sellRR1,
     sellRR2,
     riskDistance: risk,
-    breakoutLevel: resistance + Math.max(p * 0.001, atr * 0.05),
-    breakdownLevel: support - Math.max(p * 0.001, atr * 0.05),
+    breakoutLevel,
+    breakdownLevel,
     bias: trend,
     technicalScore,
     depthTrend
@@ -943,18 +980,6 @@ function buildSignal({
     target2 = levels.sellTarget2;
     stopLoss = levels.sellStop;
     riskReward = levels.sellRR1;
-  } else if (bullish) {
-    entry = levels.buyEntry;
-    target1 = levels.buyTarget1;
-    target2 = levels.buyTarget2;
-    stopLoss = levels.buyStop;
-    riskReward = levels.buyRR1;
-  } else if (bearish) {
-    entry = levels.sellEntry;
-    target1 = levels.sellTarget1;
-    target2 = levels.sellTarget2;
-    stopLoss = levels.sellStop;
-    riskReward = levels.sellRR1;
   }
 
   if ((signal === "BUY" || signal === "STRONG BUY" || signal === "BREAKOUT BUY") && riskReward < 1.5) {
@@ -964,6 +989,17 @@ function buildSignal({
   if ((signal === "SELL" || signal === "STRONG SELL") && riskReward < 1.5) {
     signal = "WAIT";
     reason = "Bearish setup rejected because R:R is below 1:1.5.";
+  }
+
+  // V7.4.2: WAIT/AVOID must never display distant or fake trade levels.
+  // The dashboard will show WAIT instead of pretending that a trade entry exists.
+  const actionable = ["BUY", "STRONG BUY", "BREAKOUT BUY", "SELL", "STRONG SELL", "EXIT"].includes(signal);
+  if (!actionable) {
+    entry = "WAIT";
+    target1 = "WAIT";
+    target2 = "WAIT";
+    stopLoss = "WAIT";
+    riskReward = 0;
   }
 
   const confidence = Math.round(clamp(
@@ -999,8 +1035,8 @@ function buildSignal({
     target2,
     stopLoss,
     riskReward,
-    riskRewardTarget1: signal === "SELL" || signal === "STRONG SELL" || signal === "EXIT" ? levels.sellRR1 : levels.buyRR1,
-    riskRewardTarget2: signal === "SELL" || signal === "STRONG SELL" || signal === "EXIT" ? levels.sellRR2 : levels.buyRR2,
+    riskRewardTarget1: actionable ? (signal === "SELL" || signal === "STRONG SELL" || signal === "EXIT" ? levels.sellRR1 : levels.buyRR1) : 0,
+    riskRewardTarget2: actionable ? (signal === "SELL" || signal === "STRONG SELL" || signal === "EXIT" ? levels.sellRR2 : levels.buyRR2) : 0,
     breakoutConfirmed,
     breakdownConfirmed,
     confirmationStatus,
