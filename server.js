@@ -1,5 +1,5 @@
 // ============================================================
-// DHARMRAJSINH LIVE MARKET V7.4.1
+// DHARMRAJSINH LIVE MARKET V7.5
 // COMPLETE SERVER.JS
 //
 // NSE + BSE EQUITY SCANNER
@@ -34,12 +34,14 @@ const fundamentalsCache = new Map();
 const newsCache = new Map();
 const lastSignal = new Map();
 const indexCache = new Map();
+const marketBreadthCache = new Map();
 
 const QUOTE_CACHE_MS = 2500;
 const TECH_CACHE_MS = 15000;
 const FUNDAMENTAL_CACHE_MS = 15 * 60 * 1000;
 const NEWS_CACHE_MS = 2 * 60 * 1000;
 const INDEX_CACHE_MS = 2500;
+const BREADTH_CACHE_MS = 30000;
 
 let runtimeAccessToken = String(process.env.UPSTOX_ACCESS_TOKEN || "").trim();
 let tokenCreatedAt = null;
@@ -530,6 +532,57 @@ async function getCandlePack(instrument) {
 }
 
 // ============================================================
+// MARKET BREADTH (NIFTY 50 TREND FILTER)
+// A stock's own technical signal is far more reliable when it agrees with
+// the overall index trend. This fetches Nifty 50 daily candles once,
+// caches it briefly, and reuses it as a directional filter/veto for every
+// stock analyzed in that window.
+// ============================================================
+
+async function getMarketBreadth() {
+  const cached = cacheGet(marketBreadthCache, "NIFTY", BREADTH_CACHE_MS);
+  if (cached) return cached;
+
+  const fallback = { trend: "NEUTRAL", available: false };
+
+  try {
+    const niftyInstrument = INDEXES[0].instrument; // NSE_INDEX|Nifty 50
+    const quote = await getLiveQuote(niftyInstrument);
+    const price = num(quote.last_price);
+
+    let daily = [];
+    try {
+      daily = await upstox.getHistoricalCandles(
+        niftyInstrument,
+        "days",
+        "1",
+        indiaDateString(),
+        dateMinusDays(120)
+      );
+    } catch (_) { /* breadth is best-effort, never block stock analysis */ }
+
+    const normalized = technical.normalizeCandles(daily);
+    const closes = normalized.map(c => c.close);
+    const ema20 = technical.ema(closes, 20);
+    const ema50 = technical.ema(closes, 50);
+
+    let trend = "NEUTRAL";
+    if (ema20 != null && ema50 != null) {
+      if (price > ema20 && ema20 > ema50) trend = "BULLISH";
+      else if (price < ema20 && ema20 < ema50) trend = "BEARISH";
+    }
+
+    return cacheSet(marketBreadthCache, "NIFTY", {
+      trend,
+      niftyPrice: round2(price),
+      available: ema20 != null && ema50 != null
+    });
+  } catch (error) {
+    return cacheSet(marketBreadthCache, "NIFTY", fallback);
+  }
+}
+
+// ============================================================
 // DEPTH
 // ============================================================
 
@@ -842,7 +895,8 @@ function buildSignal({
   levels,
   support,
   resistance,
-  instrument
+  instrument,
+  marketBreadth = { trend: "NEUTRAL", available: false }
 }) {
   const p = num(price);
   const range = Math.max(num(high) - num(low), p * 0.001);
@@ -863,12 +917,26 @@ function buildSignal({
   const newsScore = num(news.score);
   const fundamentalScore = num(fundamentals.score, 50);
 
+  // Multi-timeframe confluence: how many independent indicators agree.
+  // Falls back to a neutral 0.5 ratio when the multi-timeframe build wasn't
+  // available (e.g. not enough candles), so older single-timeframe data
+  // doesn't get unfairly penalized.
+  const confluenceRatio = technicalData.confluenceRatio != null ? technicalData.confluenceRatio : 0.5;
+  const confluenceDirection = technicalData.confluenceDirection || "NEUTRAL";
+  const timeframeAligned = Boolean(technicalData.timeframeAligned);
+  const macdTrend = technicalData.macd?.trend || "NEUTRAL";
+  const macdCrossover = technicalData.macd?.crossover || "NONE";
+  const patternBias = technicalData.candlePattern?.bias || "NEUTRAL";
+  const breadthTrend = marketBreadth.trend || "NEUTRAL";
+
   const aiScore = Math.round(clamp(
     50 +
       technicalScore * 0.25 +
       depthBias * 0.12 +
       newsScore * 2 +
-      (fundamentalScore - 50) * 0.10,
+      (fundamentalScore - 50) * 0.10 +
+      (confluenceDirection === "BULLISH" ? confluenceRatio * 8 : confluenceDirection === "BEARISH" ? -confluenceRatio * 8 : 0) +
+      (timeframeAligned ? (technicalData.dailyTrend === "BULLISH" ? 6 : -6) : 0),
     0,
     100
   ));
@@ -879,6 +947,19 @@ function buildSignal({
   const sellersConfirmed = depth.trend === "SELLERS_STRONG" || depth.totalDepth === 0;
   const newsBullish = news.impact !== "NEGATIVE";
   const newsBearish = news.impact !== "POSITIVE";
+
+  // Market breadth acts as a soft veto: don't fight the index. If Nifty is
+  // clearly trending the opposite way, "strong" grades get held back to a
+  // normal grade instead of being blocked outright (a stock can still move
+  // against the index, just with lower confidence).
+  const breadthBullishOk = breadthTrend !== "BEARISH" || !marketBreadth.available;
+  const breadthBearishOk = breadthTrend !== "BULLISH" || !marketBreadth.available;
+
+  // MACD + candlestick pattern must not actively contradict the trade.
+  const macdBullishOk = macdTrend !== "BEARISH";
+  const macdBearishOk = macdTrend !== "BULLISH";
+  const patternBullishOk = patternBias !== "BEARISH";
+  const patternBearishOk = patternBias !== "BULLISH";
 
   const breakoutConfirmed =
     p > levels.breakoutLevel &&
@@ -898,6 +979,10 @@ function buildSignal({
     aiScore >= 72 &&
     buyersConfirmed &&
     newsBullish &&
+    breadthBullishOk &&
+    macdBullishOk &&
+    patternBullishOk &&
+    (technicalData.confluenceTotal == null || confluenceDirection !== "BEARISH") &&
     levels.buyRR1 >= 1.5;
 
   const buy =
@@ -906,6 +991,7 @@ function buildSignal({
     aiScore >= 62 &&
     buyersConfirmed &&
     newsBullish &&
+    patternBullishOk &&
     levels.buyRR1 >= 1.5;
 
   const strongSell =
@@ -914,6 +1000,10 @@ function buildSignal({
     aiScore <= 32 &&
     sellersConfirmed &&
     newsBearish &&
+    breadthBearishOk &&
+    macdBearishOk &&
+    patternBearishOk &&
+    (technicalData.confluenceTotal == null || confluenceDirection !== "BULLISH") &&
     levels.sellRR1 >= 1.5;
 
   const sell =
@@ -922,6 +1012,7 @@ function buildSignal({
     aiScore <= 45 &&
     sellersConfirmed &&
     newsBearish &&
+    patternBearishOk &&
     levels.sellRR1 >= 1.5;
 
   let signal = "WAIT";
@@ -937,7 +1028,7 @@ function buildSignal({
     signal = "BUY";
     reason = "Bullish technical trend confirmed with market depth, news filter and acceptable R:R.";
   } else if (breakdownConfirmed && strongSell) {
-    signal = "STRONG SELL";
+    signal = "BREAKDOWN SELL";
     reason = "Support breakdown confirmed by bearish momentum, seller depth and R:R.";
   } else if (strongSell) {
     signal = "STRONG SELL";
@@ -954,7 +1045,7 @@ function buildSignal({
   if (
     previous &&
     ["BUY", "STRONG BUY", "BREAKOUT BUY"].includes(previous) &&
-    ["SELL", "STRONG SELL"].includes(signal)
+    ["SELL", "STRONG SELL", "BREAKDOWN SELL"].includes(signal)
   ) {
     signal = "EXIT";
     reason = "Previous bullish setup has reversed to a confirmed bearish structure. Exit-risk condition detected.";
@@ -974,7 +1065,7 @@ function buildSignal({
     target2 = levels.buyTarget2;
     stopLoss = levels.buyStop;
     riskReward = levels.buyRR1;
-  } else if (["SELL", "STRONG SELL", "EXIT"].includes(signal)) {
+  } else if (["SELL", "STRONG SELL", "BREAKDOWN SELL", "EXIT"].includes(signal)) {
     entry = levels.sellEntry;
     target1 = levels.sellTarget1;
     target2 = levels.sellTarget2;
@@ -986,14 +1077,14 @@ function buildSignal({
     signal = "WAIT";
     reason = "Bullish setup rejected because R:R is below 1:1.5.";
   }
-  if ((signal === "SELL" || signal === "STRONG SELL") && riskReward < 1.5) {
+  if ((signal === "SELL" || signal === "STRONG SELL" || signal === "BREAKDOWN SELL") && riskReward < 1.5) {
     signal = "WAIT";
     reason = "Bearish setup rejected because R:R is below 1:1.5.";
   }
 
   // V7.4.2: WAIT/AVOID must never display distant or fake trade levels.
   // The dashboard will show WAIT instead of pretending that a trade entry exists.
-  const actionable = ["BUY", "STRONG BUY", "BREAKOUT BUY", "SELL", "STRONG SELL", "EXIT"].includes(signal);
+  const actionable = ["BUY", "STRONG BUY", "BREAKOUT BUY", "SELL", "STRONG SELL", "BREAKDOWN SELL", "EXIT"].includes(signal);
   if (!actionable) {
     entry = "WAIT";
     target1 = "WAIT";
@@ -1015,7 +1106,7 @@ function buildSignal({
       ? "STRONG BUY CONFIRMED"
       : signal === "BUY"
         ? "BUY CONFIRMED"
-        : signal === "STRONG SELL"
+        : signal === "STRONG SELL" || signal === "BREAKDOWN SELL"
           ? "STRONG SELL CONFIRMED"
           : signal === "SELL"
             ? "SELL CONFIRMED"
@@ -1035,8 +1126,8 @@ function buildSignal({
     target2,
     stopLoss,
     riskReward,
-    riskRewardTarget1: actionable ? (signal === "SELL" || signal === "STRONG SELL" || signal === "EXIT" ? levels.sellRR1 : levels.buyRR1) : 0,
-    riskRewardTarget2: actionable ? (signal === "SELL" || signal === "STRONG SELL" || signal === "EXIT" ? levels.sellRR2 : levels.buyRR2) : 0,
+    riskRewardTarget1: actionable ? (["SELL", "STRONG SELL", "BREAKDOWN SELL", "EXIT"].includes(signal) ? levels.sellRR1 : levels.buyRR1) : 0,
+    riskRewardTarget2: actionable ? (["SELL", "STRONG SELL", "BREAKDOWN SELL", "EXIT"].includes(signal) ? levels.sellRR2 : levels.buyRR2) : 0,
     breakoutConfirmed,
     breakdownConfirmed,
     confirmationStatus,
@@ -1049,6 +1140,18 @@ function buildSignal({
       rsiSignal: technicalData.rsiSignal,
       volumeConfirmed: Boolean(technicalData.volumeConfirmed),
       volumeRatio: technicalData.volumeRatio,
+      volumeTrend: technicalData.volumeTrend,
+      macdTrend,
+      macdCrossover,
+      candlePattern: technicalData.candlePattern?.pattern || "NONE",
+      patternBias,
+      dailyTrend: technicalData.dailyTrend,
+      intradayTrend: technicalData.intradayTrend,
+      timeframeAligned,
+      confluenceCount: technicalData.confluenceCount,
+      confluenceTotal: technicalData.confluenceTotal,
+      confluenceDirection,
+      marketBreadthTrend: breadthTrend,
       buyersConfirmed: depth.buyersConfirmed,
       sellersConfirmed: depth.sellersConfirmed,
       confirmationStatus
@@ -1092,8 +1195,16 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
 
   const intraday = candlePack.intraday;
   const daily = candlePack.daily;
-  const technicalInput = intraday.length >= 20 ? intraday : daily;
-  const technicalData = technical.buildTechnical(technicalInput, price);
+
+  // Multi-timeframe: daily candles set the structural trend (EMA20/50, MACD,
+  // RSI, Bollinger), intraday 1-min candles set the live entry timing
+  // (EMA9, VWAP, latest volume/pattern). Falls back gracefully when one
+  // side has too little data.
+  const technicalData = (daily.length >= 20 && intraday.length >= 20)
+    ? technical.buildMultiTimeframeTechnical(daily, intraday, price)
+    : technical.buildTechnical(intraday.length >= 20 ? intraday : daily, price);
+
+  const marketBreadth = await getMarketBreadth();
 
   const recentDaily = daily.slice(-20);
   const recentHigh = recentDaily.length
@@ -1136,7 +1247,8 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
     levels,
     support,
     resistance,
-    instrument
+    instrument,
+    marketBreadth
   });
 
   const lastTradeTime = quote.last_trade_time
@@ -1186,15 +1298,21 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
       ema9: round2(technicalData.ema9),
       ema20: round2(technicalData.ema20),
       ema50: round2(technicalData.ema50),
+      dailyEma20: round2(technicalData.dailyEma20),
+      dailyEma50: round2(technicalData.dailyEma50),
       vwap: round2(technicalData.vwap),
       rsi: round2(technicalData.rsi),
+      dailyRsi: round2(technicalData.dailyRsi),
+      intradayRsi: round2(technicalData.intradayRsi),
       atr: round2(technicalData.atr),
+      dailyAtr: round2(technicalData.dailyAtr),
       averageVolume20: round2(technicalData.averageVolume20),
       volumeRatio: technicalData.volumeRatio == null ? null : round2(technicalData.volumeRatio),
       recentHigh20: round2(technicalData.recentHigh20),
       recentLow20: round2(technicalData.recentLow20)
     },
     technicalConfirmation: signal.technicalConfirmation,
+    marketBreadth,
     marketDepth: depth,
     news,
     fundamentals,
@@ -1419,7 +1537,7 @@ app.get("/api/health", (req, res) => {
   res.json({
     success: true,
     app: "Dharmrajsinh Live Market",
-    version: "7.4.0",
+    version: "7.5.0",
     serverTime: new Date().toISOString(),
     marketOpen: marketOpenNow(),
     upstoxToken: hasAccessToken() ? "AVAILABLE" : "MISSING",
@@ -1430,10 +1548,17 @@ app.get("/api/health", (req, res) => {
       "Previous Close",
       "Average Trade Price",
       "Market Depth",
-      "Technical Analysis",
+      "Multi-Timeframe Technical Analysis (Daily + Intraday)",
+      "MACD",
+      "Bollinger Bands",
+      "Candlestick Pattern Detection",
+      "Volume Trend (Accumulation/Distribution)",
+      "Multi-Indicator Confluence Scoring",
+      "Nifty 50 Market Breadth Filter",
       "Fundamental Analysis",
       "News Impact",
-      "Buy / Strong Buy / Wait / Sell / Strong Sell / Exit",
+      "Auto-Retry on API Failures",
+      "Buy / Strong Buy / Breakout Buy / Wait / Sell / Strong Sell / Breakdown Sell / Exit",
       "Nifty 50",
       "Sensex",
       "MidcapNifty",
@@ -1466,7 +1591,7 @@ app.use((error, req, res, next) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("================================================");
-  console.log("DHARMRAJSINH LIVE MARKET V7.4.1");
+  console.log("DHARMRAJSINH LIVE MARKET V7.5");
   console.log("================================================");
   console.log(`Server running on port ${PORT}`);
   console.log(`Upstox token: ${hasAccessToken() ? "AVAILABLE" : "MISSING"}`);
