@@ -1,5 +1,5 @@
 // ============================================================
-// DHARMRAJSINH LIVE MARKET V7.4
+// DHARMRAJSINH LIVE MARKET V7.4.1
 // COMPLETE SERVER.JS
 //
 // NSE + BSE EQUITY SCANNER
@@ -333,16 +333,103 @@ try {
   }
 } catch (_) {}
 
+function normalizeSearchText(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+}
+
+function rankSearchResults(rows, query) {
+  const q = normalizeSearchText(query);
+
+  const mapped = rows.map(item => ({
+    symbol: item.trading_symbol || item.short_name || item.name || "",
+    name: item.name || item.short_name || item.trading_symbol || "",
+    exchange: item.exchange || String(item.segment || "").split("_")[0],
+    segment: item.segment || "EQ",
+    instrument: item.instrument_key || "",
+    isin: item.isin || "",
+    securityType: item.security_type || "",
+    source: "Upstox"
+  })).filter(item => {
+    const ex = String(item.exchange || "").toUpperCase();
+    const segment = String(item.segment || "").toUpperCase();
+    return item.instrument &&
+      (ex === "NSE" || ex === "BSE") &&
+      (segment === "EQ" || segment.endsWith("_EQ"));
+  });
+
+  // Remove duplicate instrument keys.
+  const unique = Array.from(
+    new Map(mapped.map(item => [item.instrument, item])).values()
+  );
+
+  return unique.sort((a, b) => {
+    const as = normalizeSearchText(a.symbol);
+    const bs = normalizeSearchText(b.symbol);
+    const an = normalizeSearchText(a.name);
+    const bn = normalizeSearchText(b.name);
+
+    const score = value =>
+      value === q ? 0 :
+      value.startsWith(q) ? 1 :
+      value.includes(q) ? 2 : 3;
+
+    const sa = Math.min(score(as), score(an));
+    const sb = Math.min(score(bs), score(bn));
+
+    if (sa !== sb) return sa - sb;
+
+    // For the same company available on NSE and BSE, keep NSE first.
+    const ae = String(a.exchange).toUpperCase() === "NSE" ? 0 : 1;
+    const be = String(b.exchange).toUpperCase() === "NSE" ? 0 : 1;
+    if (ae !== be) return ae - be;
+
+    return as.localeCompare(bs);
+  }).slice(0, 30);
+}
+
+function localSearch(query) {
+  const q = normalizeSearchText(query);
+
+  return fallbackStocks
+    .filter(x => {
+      const symbol = normalizeSearchText(x.symbol);
+      const name = normalizeSearchText(x.name);
+      return symbol.includes(q) || name.includes(q);
+    })
+    .map(x => ({
+      symbol: x.symbol || "",
+      name: x.name || x.symbol || "",
+      exchange: x.exchange || "",
+      segment: x.segment || "EQ",
+      instrument: x.instrument || "",
+      isin: x.isin || String(x.instrument || "").split("|")[1] || "",
+      securityType: x.securityType || "",
+      source: "stocks.json"
+    }))
+    .filter(x => x.instrument);
+}
+
 app.get("/api/search", async (req, res) => {
   const query = String(req.query.q || "").trim();
-  if (!query) return res.status(400).json({ success: false, message: "Search query required." });
+
+  if (!query) {
+    return res.status(400).json({
+      success: false,
+      message: "Search query required."
+    });
+  }
 
   if (!hasAccessToken()) {
-    const local = fallbackStocks.filter(x =>
-      String(x.symbol || "").toUpperCase().includes(query.toUpperCase()) ||
-      String(x.name || "").toUpperCase().includes(query.toUpperCase())
-    );
-    return res.json({ success: true, source: "stocks.json", results: local });
+    const local = localSearch(query);
+    return res.json({
+      success: true,
+      source: "stocks.json",
+      query,
+      results: local
+    });
   }
 
   try {
@@ -353,31 +440,41 @@ app.get("/api/search", async (req, res) => {
     });
 
     const rows = Array.isArray(data.data) ? data.data : [];
-    const results = rows.map(item => ({
-      symbol: item.trading_symbol || item.short_name || item.name || "",
-      name: item.name || item.short_name || item.trading_symbol || "",
-      exchange: item.exchange || String(item.segment || "").split("_")[0],
-      segment: item.segment || "EQ",
-      instrument: item.instrument_key || "",
-      isin: item.isin || "",
-      securityType: item.security_type || "",
-      source: "Upstox"
-    })).filter(x => x.instrument);
+    const results = rankSearchResults(rows, query);
 
-    return res.json({ success: true, source: "Upstox", results });
+    // If Upstox returns nothing, try local aliases as a fallback.
+    if (!results.length) {
+      const local = localSearch(query);
+      return res.json({
+        success: local.length > 0,
+        source: local.length ? "stocks.json" : "Upstox",
+        query,
+        results: local,
+        message: local.length
+          ? "Upstox returned no matching equity; showing local fallback."
+          : "No matching NSE/BSE equity instrument found."
+      });
+    }
+
+    return res.json({
+      success: true,
+      source: "Upstox",
+      query,
+      results
+    });
   } catch (error) {
     if (isUnauthorized(error)) return sendTokenExpired(res);
 
-    const local = fallbackStocks.filter(x =>
-      String(x.symbol || "").toUpperCase().includes(query.toUpperCase()) ||
-      String(x.name || "").toUpperCase().includes(query.toUpperCase())
-    );
+    const local = localSearch(query);
 
-    res.status(local.length ? 200 : error.statusCode || 500).json({
+    return res.status(local.length ? 200 : (error.statusCode || 500)).json({
       success: local.length > 0,
       source: local.length ? "stocks.json" : "Upstox",
+      query,
       results: local,
-      message: local.length ? "Upstox search unavailable; showing local fallback." : error.message
+      message: local.length
+        ? "Upstox search unavailable; showing local fallback."
+        : error.message
     });
   }
 });
@@ -1333,7 +1430,7 @@ app.use((error, req, res, next) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("================================================");
-  console.log("DHARMRAJSINH LIVE MARKET V7.4");
+  console.log("DHARMRAJSINH LIVE MARKET V7.4.1");
   console.log("================================================");
   console.log(`Server running on port ${PORT}`);
   console.log(`Upstox token: ${hasAccessToken() ? "AVAILABLE" : "MISSING"}`);
