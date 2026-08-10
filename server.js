@@ -35,6 +35,7 @@ const newsCache = new Map();
 const lastSignal = new Map();
 const indexCache = new Map();
 const marketBreadthCache = new Map();
+const vixCache = new Map();
 
 const QUOTE_CACHE_MS = 2500;
 const TECH_CACHE_MS = 15000;
@@ -42,10 +43,146 @@ const FUNDAMENTAL_CACHE_MS = 15 * 60 * 1000;
 const NEWS_CACHE_MS = 2 * 60 * 1000;
 const INDEX_CACHE_MS = 2500;
 const BREADTH_CACHE_MS = 30000;
+const VIX_CACHE_MS = 30000;
 
 let runtimeAccessToken = String(process.env.UPSTOX_ACCESS_TOKEN || "").trim();
 let tokenCreatedAt = null;
 let lastAuthError = null;
+
+// ============================================================
+// SIGNAL ACCURACY TRACKING (TRADE JOURNAL)
+// Every actionable signal (BUY/STRONG BUY/BREAKOUT BUY/SELL/STRONG
+// SELL/BREAKDOWN SELL) is logged once. A lightweight background check
+// compares the live price against target1/target2/stopLoss to close the
+// entry out, so the system's own win-rate can be measured instead of
+// just trusted. Best-effort file persistence — never blocks or crashes
+// analysis if the disk isn't writable (e.g. read-only containers).
+// ============================================================
+
+const JOURNAL_DIR = path.join(__dirname, "data");
+const JOURNAL_FILE = path.join(JOURNAL_DIR, "signals-journal.json");
+const JOURNAL_MAX_ENTRIES = 500;
+const JOURNAL_EXPIRE_MS = 3 * 24 * 60 * 60 * 1000; // auto-expire open trades after 3 days
+
+let journalEntries = [];
+
+function loadJournal() {
+  try {
+    if (fs.existsSync(JOURNAL_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(JOURNAL_FILE, "utf8"));
+      if (Array.isArray(raw)) journalEntries = raw;
+    }
+  } catch (_) {
+    journalEntries = [];
+  }
+}
+
+function saveJournal() {
+  try {
+    if (!fs.existsSync(JOURNAL_DIR)) fs.mkdirSync(JOURNAL_DIR, { recursive: true });
+    fs.writeFileSync(JOURNAL_FILE, JSON.stringify(journalEntries.slice(-JOURNAL_MAX_ENTRIES), null, 2));
+  } catch (_) {
+    // Best-effort only; in-memory tracking still works for this process lifetime.
+  }
+}
+
+loadJournal();
+
+const LONG_SIGNALS = ["BUY", "STRONG BUY", "BREAKOUT BUY"];
+const SHORT_SIGNALS = ["SELL", "STRONG SELL", "BREAKDOWN SELL"];
+
+function recordSignalIfNew({ instrument, symbol, name, signal, entry, target1, target2, stopLoss, price }) {
+  const isLong = LONG_SIGNALS.includes(signal);
+  const isShort = SHORT_SIGNALS.includes(signal);
+  if (!isLong && !isShort) return;
+  if (![entry, target1, target2, stopLoss].every(v => Number.isFinite(Number(v)))) return;
+
+  const alreadyOpen = journalEntries.some(e => e.instrument === instrument && e.status === "OPEN");
+  if (alreadyOpen) return;
+
+  journalEntries.push({
+    id: `${instrument}-${Date.now()}`,
+    instrument,
+    symbol,
+    name,
+    direction: isLong ? "LONG" : "SHORT",
+    signal,
+    entry: num(entry),
+    target1: num(target1),
+    target2: num(target2),
+    stopLoss: num(stopLoss),
+    priceAtSignal: num(price),
+    status: "OPEN",
+    target1Hit: false,
+    outcome: null,
+    createdAt: new Date().toISOString(),
+    closedAt: null,
+    closePrice: null
+  });
+  saveJournal();
+}
+
+async function checkOpenJournalEntries() {
+  const open = journalEntries.filter(e => e.status === "OPEN");
+  if (!open.length) return;
+
+  let changed = false;
+  for (const e of open) {
+    if (Date.now() - new Date(e.createdAt).getTime() > JOURNAL_EXPIRE_MS) {
+      e.status = "CLOSED";
+      e.outcome = "EXPIRED";
+      e.closedAt = new Date().toISOString();
+      changed = true;
+      continue;
+    }
+
+    let price;
+    try {
+      const quote = await getLiveQuote(e.instrument);
+      price = num(quote.last_price);
+    } catch (_) {
+      continue; // skip this one this cycle, try again next cycle
+    }
+    if (!(price > 0)) continue;
+
+    if (e.direction === "LONG") {
+      if (price <= e.stopLoss) {
+        e.status = "CLOSED"; e.outcome = "STOPLOSS_HIT"; e.closedAt = new Date().toISOString(); e.closePrice = price; changed = true;
+      } else if (price >= e.target2) {
+        e.status = "CLOSED"; e.outcome = "TARGET2_HIT"; e.closedAt = new Date().toISOString(); e.closePrice = price; changed = true;
+      } else if (price >= e.target1 && !e.target1Hit) {
+        e.target1Hit = true; changed = true;
+      }
+    } else {
+      if (price >= e.stopLoss) {
+        e.status = "CLOSED"; e.outcome = "STOPLOSS_HIT"; e.closedAt = new Date().toISOString(); e.closePrice = price; changed = true;
+      } else if (price <= e.target2) {
+        e.status = "CLOSED"; e.outcome = "TARGET2_HIT"; e.closedAt = new Date().toISOString(); e.closePrice = price; changed = true;
+      } else if (price <= e.target1 && !e.target1Hit) {
+        e.target1Hit = true; changed = true;
+      }
+    }
+  }
+
+  if (changed) saveJournal();
+}
+
+function journalStats() {
+  const closed = journalEntries.filter(e => e.status === "CLOSED" && e.outcome !== "EXPIRED");
+  const wins = closed.filter(e => e.outcome === "TARGET1_HIT" || e.outcome === "TARGET2_HIT" || (e.status === "OPEN" && e.target1Hit));
+  const losses = closed.filter(e => e.outcome === "STOPLOSS_HIT");
+  const openCount = journalEntries.filter(e => e.status === "OPEN").length;
+  const winRate = closed.length > 0 ? round2((wins.length / closed.length) * 100) : null;
+
+  return {
+    totalSignals: journalEntries.length,
+    open: openCount,
+    closed: closed.length,
+    wins: wins.length,
+    losses: losses.length,
+    winRate
+  };
+}
 
 // ============================================================
 // CONFIG
@@ -583,6 +720,83 @@ async function getMarketBreadth() {
 }
 
 // ============================================================
+// INDIA VIX (VOLATILITY FILTER)
+// Higher VIX means wider, choppier moves — stop-loss distance and
+// confidence should adapt instead of using a fixed risk distance
+// regardless of how volatile the market currently is.
+// ============================================================
+
+async function getVixLevel() {
+  const cached = cacheGet(vixCache, "VIX", VIX_CACHE_MS);
+  if (cached) return cached;
+
+  const fallback = { value: null, level: "NORMAL", riskMultiplier: 1, available: false };
+
+  try {
+    const vixItem = INDEXES.find(x => x.id === "INDIAVIX");
+    const quote = await getLiveQuote(vixItem.instrument);
+    const value = num(quote.last_price);
+
+    let level = "NORMAL";
+    let riskMultiplier = 1;
+    if (value >= 25) { level = "EXTREME"; riskMultiplier = 1.6; }
+    else if (value >= 18) { level = "HIGH"; riskMultiplier = 1.3; }
+    else if (value <= 11) { level = "LOW"; riskMultiplier = 0.85; }
+
+    return cacheSet(vixCache, "VIX", { value: round2(value), level, riskMultiplier, available: value > 0 });
+  } catch (error) {
+    return cacheSet(vixCache, "VIX", fallback);
+  }
+}
+
+// ============================================================
+// OPENING RANGE BREAKOUT (ORB)
+// First 15 minutes of the trading session (09:15-09:30 IST) mark the
+// opening range. A confirmed break above/below that range on rising
+// volume is one of the most widely used intraday setups in Indian
+// markets, and it is independent of the multi-timeframe EMA/RSI logic.
+// ============================================================
+
+function calculateORB(intradayCandles, rangeMinutes = 15) {
+  const candles = technical.normalizeCandles(intradayCandles);
+  if (!candles.length) return { available: false };
+
+  const todayStr = indiaDateString();
+  const sessionCandles = candles.filter(c => {
+    const ts = new Date(c.timestamp);
+    return indiaDateString(ts) === todayStr;
+  });
+  if (!sessionCandles.length) return { available: false };
+
+  const sessionStart = new Date(sessionCandles[0].timestamp);
+  const rangeEndMs = sessionStart.getTime() + rangeMinutes * 60000;
+
+  const orbCandles = sessionCandles.filter(c => new Date(c.timestamp).getTime() <= rangeEndMs);
+  if (!orbCandles.length) return { available: false };
+
+  const orbHigh = Math.max(...orbCandles.map(c => c.high));
+  const orbLow = Math.min(...orbCandles.map(c => c.low));
+  const orbRange = orbHigh - orbLow;
+
+  const afterOrb = sessionCandles.filter(c => new Date(c.timestamp).getTime() > rangeEndMs);
+  const latest = sessionCandles.at(-1);
+
+  const breakoutConfirmed = afterOrb.length > 0 && latest.close > orbHigh;
+  const breakdownConfirmed = afterOrb.length > 0 && latest.close < orbLow;
+
+  return {
+    available: true,
+    orbHigh: round2(orbHigh),
+    orbLow: round2(orbLow),
+    orbRange: round2(orbRange),
+    breakoutConfirmed,
+    breakdownConfirmed,
+    bias: breakoutConfirmed ? "BULLISH" : breakdownConfirmed ? "BEARISH" : "NEUTRAL",
+    formedAt: new Date(rangeEndMs).toISOString()
+  };
+}
+
+// ============================================================
 // DEPTH
 // ============================================================
 
@@ -798,12 +1012,12 @@ async function getFundamentalAnalysis(instrument) {
 // TRADE LEVELS + SIGNAL ENGINE
 // ============================================================
 
-function calculateLevels({ price, support, resistance, atrValue, trend, technicalScore, depthTrend }) {
+function calculateLevels({ price, support, resistance, atrValue, trend, technicalScore, depthTrend, vixMultiplier = 1 }) {
   // V7.4.2: Intraday-safe level engine.
   // Do not use a distant 20-day resistance as the immediate entry.
   const p = num(price);
-  const atr = Math.max(num(atrValue), p * 0.004);
-  const risk = Math.max(atr * 0.8, p * 0.006);
+  const atr = Math.max(num(atrValue), p * 0.004) * vixMultiplier;
+  const risk = Math.max(atr * 0.8, p * 0.006 * vixMultiplier);
   const minGap = Math.max(p * 0.001, atr * 0.05);
   const maxEntryDistance = Math.max(p * 0.006, atr * 0.75);
 
@@ -896,7 +1110,9 @@ function buildSignal({
   support,
   resistance,
   instrument,
-  marketBreadth = { trend: "NEUTRAL", available: false }
+  marketBreadth = { trend: "NEUTRAL", available: false },
+  vix = { level: "NORMAL", available: false },
+  orb = { available: false }
 }) {
   const p = num(price);
   const range = Math.max(num(high) - num(low), p * 0.001);
@@ -928,6 +1144,8 @@ function buildSignal({
   const macdCrossover = technicalData.macd?.crossover || "NONE";
   const patternBias = technicalData.candlePattern?.bias || "NEUTRAL";
   const breadthTrend = marketBreadth.trend || "NEUTRAL";
+  const orbBias = orb.available ? orb.bias : "NEUTRAL";
+  const vixLevel = vix.level || "NORMAL";
 
   const aiScore = Math.round(clamp(
     50 +
@@ -936,7 +1154,8 @@ function buildSignal({
       newsScore * 2 +
       (fundamentalScore - 50) * 0.10 +
       (confluenceDirection === "BULLISH" ? confluenceRatio * 8 : confluenceDirection === "BEARISH" ? -confluenceRatio * 8 : 0) +
-      (timeframeAligned ? (technicalData.dailyTrend === "BULLISH" ? 6 : -6) : 0),
+      (timeframeAligned ? (technicalData.dailyTrend === "BULLISH" ? 6 : -6) : 0) +
+      (orbBias === "BULLISH" ? 6 : orbBias === "BEARISH" ? -6 : 0),
     0,
     100
   ));
@@ -1093,8 +1312,10 @@ function buildSignal({
     riskReward = 0;
   }
 
+  const vixConfidenceAdjust = vixLevel === "EXTREME" ? -8 : vixLevel === "HIGH" ? -4 : vixLevel === "LOW" ? 3 : 0;
   const confidence = Math.round(clamp(
-    50 + Math.abs(technicalScore) * 0.25 + Math.abs(depthBias) * 0.15 + Math.abs(newsScore) * 2,
+    50 + Math.abs(technicalScore) * 0.25 + Math.abs(depthBias) * 0.15 + Math.abs(newsScore) * 2 +
+      confluenceRatio * 10 + (timeframeAligned ? 5 : 0) + vixConfidenceAdjust,
     50,
     95
   ));
@@ -1152,6 +1373,12 @@ function buildSignal({
       confluenceTotal: technicalData.confluenceTotal,
       confluenceDirection,
       marketBreadthTrend: breadthTrend,
+      vixLevel,
+      vixValue: vix.value ?? null,
+      orbAvailable: Boolean(orb.available),
+      orbHigh: orb.orbHigh ?? null,
+      orbLow: orb.orbLow ?? null,
+      orbBias,
       buyersConfirmed: depth.buyersConfirmed,
       sellersConfirmed: depth.sellersConfirmed,
       confirmationStatus
@@ -1205,6 +1432,8 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
     : technical.buildTechnical(intraday.length >= 20 ? intraday : daily, price);
 
   const marketBreadth = await getMarketBreadth();
+  const vix = await getVixLevel();
+  const orb = calculateORB(intraday);
 
   const recentDaily = daily.slice(-20);
   const recentHigh = recentDaily.length
@@ -1231,7 +1460,8 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
     atrValue: technicalData.atr,
     trend: technicalData.emaTrend,
     technicalScore: technicalData.technicalScore,
-    depthTrend: depth.trend
+    depthTrend: depth.trend,
+    vixMultiplier: vix.riskMultiplier || 1
   });
 
   const signal = buildSignal({
@@ -1248,14 +1478,16 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
     support,
     resistance,
     instrument,
-    marketBreadth
+    marketBreadth,
+    vix,
+    orb
   });
 
   const lastTradeTime = quote.last_trade_time
     ? new Date(Number(quote.last_trade_time)).toISOString()
     : quote.timestamp || null;
 
-  return {
+  const result = {
     success: true,
     symbol: symbol || quote.symbol || "",
     name: name || quote.symbol || "",
@@ -1313,6 +1545,8 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
     },
     technicalConfirmation: signal.technicalConfirmation,
     marketBreadth,
+    vix,
+    orb,
     marketDepth: depth,
     news,
     fundamentals,
@@ -1323,6 +1557,20 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
       analysisGeneratedAt: new Date().toISOString()
     }
   };
+
+  recordSignalIfNew({
+    instrument,
+    symbol: symbol || quote.symbol || "",
+    name: name || quote.symbol || "",
+    signal: signal.signal,
+    entry: signal.entry,
+    target1: signal.target1,
+    target2: signal.target2,
+    stopLoss: signal.stopLoss,
+    price
+  });
+
+  return result;
 }
 
 // ============================================================
@@ -1348,6 +1596,101 @@ app.get("/api/live", async (req, res) => {
     }
     console.error("LIVE ERROR:", error.message);
     res.status(error.statusCode || 500).json({ success: false, message: error.message, error: error.data || null });
+  }
+});
+
+// ============================================================
+// MARKET SCANNER
+// Scans the local watchlist (stocks.json) and surfaces stocks with an
+// actionable signal right now, instead of the user checking one stock
+// at a time. Runs with limited concurrency to stay inside Upstox rate
+// limits, and never lets one failing stock break the whole scan.
+// ============================================================
+
+async function runWithConcurrency(items, limit, worker) {
+  const results = [];
+  let index = 0;
+
+  async function next() {
+    while (index < items.length) {
+      const current = index++;
+      try {
+        results[current] = await worker(items[current]);
+      } catch (error) {
+        results[current] = { error: error.message };
+      }
+    }
+  }
+
+  const runners = Array.from({ length: Math.min(limit, items.length) }, next);
+  await Promise.all(runners);
+  return results;
+}
+
+app.get("/api/scanner", async (req, res) => {
+  if (!hasAccessToken()) return sendTokenExpired(res);
+
+  const requestedSymbols = String(req.query.symbols || "")
+    .split(",")
+    .map(s => s.trim().toUpperCase())
+    .filter(Boolean);
+
+  const watchlist = requestedSymbols.length
+    ? fallbackStocks.filter(s => requestedSymbols.includes(String(s.symbol || "").toUpperCase()))
+    : fallbackStocks;
+
+  if (!watchlist.length) {
+    return res.status(400).json({ success: false, message: "No matching stocks found in watchlist." });
+  }
+
+  const onlyActionable = req.query.all !== "true";
+
+  try {
+    const raw = await runWithConcurrency(watchlist, 3, async (stock) => {
+      const data = await analyzeInstrument({
+        instrument: stock.instrument,
+        symbol: stock.symbol,
+        name: stock.name,
+        exchange: stock.exchange
+      });
+      return {
+        symbol: data.symbol,
+        name: data.name,
+        exchange: data.exchange,
+        instrument: stock.instrument,
+        price: data.price,
+        signal: data.signal,
+        aiScore: data.aiScore,
+        confidence: data.confidence,
+        technicalScore: data.technicalScore,
+        entry: data.entry,
+        target1: data.target1,
+        stopLoss: data.stopLoss,
+        riskReward: data.riskReward,
+        trend: data.trend
+      };
+    });
+
+    const results = raw.filter(r => r && !r.error);
+    const failed = raw.filter(r => r && r.error);
+
+    const filtered = onlyActionable
+      ? results.filter(r => LONG_SIGNALS.includes(r.signal) || SHORT_SIGNALS.includes(r.signal))
+      : results;
+
+    filtered.sort((a, b) => num(b.aiScore) - num(a.aiScore));
+
+    res.json({
+      success: true,
+      scannedCount: watchlist.length,
+      matchedCount: filtered.length,
+      failedCount: failed.length,
+      results: filtered,
+      updatedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    if (isUnauthorized(error)) return sendTokenExpired(res);
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
   }
 });
 
@@ -1516,6 +1859,21 @@ app.get("/api/fundamentals", async (req, res) => {
 });
 
 // ============================================================
+// SIGNAL JOURNAL API
+// ============================================================
+
+app.get("/api/journal", (req, res) => {
+  const limit = clamp(num(req.query.limit, 50), 1, JOURNAL_MAX_ENTRIES);
+  const entries = journalEntries.slice(-limit).reverse();
+
+  res.json({
+    success: true,
+    stats: journalStats(),
+    entries
+  });
+});
+
+// ============================================================
 // SUPPORTED MARKETS
 // ============================================================
 
@@ -1555,6 +1913,10 @@ app.get("/api/health", (req, res) => {
       "Volume Trend (Accumulation/Distribution)",
       "Multi-Indicator Confluence Scoring",
       "Nifty 50 Market Breadth Filter",
+      "India VIX Volatility-Adjusted Risk",
+      "Opening Range Breakout (ORB)",
+      "Signal Accuracy Tracking (Trade Journal)",
+      "Market Scanner (Watchlist)",
       "Fundamental Analysis",
       "News Impact",
       "Auto-Retry on API Failures",
@@ -1598,4 +1960,13 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("NSE + BSE Equity | NIFTY 50 | SENSEX | MIDCPNIFTY | INDIA VIX");
   console.log("Technical + Fundamental + News + Depth + Live Levels");
   console.log("================================================");
+
+  // Signal journal: check open trades against live price every 60s.
+  // Best-effort — skipped silently if no token is available yet.
+  const journalInterval = setInterval(() => {
+    if (hasAccessToken()) {
+      checkOpenJournalEntries().catch(() => {});
+    }
+  }, 60000);
+  journalInterval.unref();
 });
