@@ -40,6 +40,7 @@ button{cursor:pointer}
 .negative{color:var(--red)}
 .neutral{color:var(--amber)}
 .index-meta{font-size:10px;color:var(--muted);margin-top:8px}
+.index-ohlc{display:flex;gap:8px;margin-top:6px;font-size:10px;color:#94a3b8;font-weight:700}
 .search-panel{padding:14px;margin-bottom:14px}
 .tool-row{display:flex;gap:8px;margin-top:10px}
 .tool-btn{flex:1;border:1px solid #334155;border-radius:12px;padding:11px 10px;background:#1a2c47;color:#e2e8f0;font-weight:800;cursor:pointer}
@@ -78,6 +79,10 @@ button{cursor:pointer}
 .price{font-size:31px;font-weight:900}
 .price-sub{font-size:13px;font-weight:800}
 .live-label{font-size:10px;color:#86efac;font-weight:800}
+.ohlc-row{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:14px}
+.ohlc-box{background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:10px;padding:8px;text-align:center}
+.ohlc-box span{display:block;font-size:9px;color:var(--muted);margin-bottom:3px;text-transform:uppercase;letter-spacing:.03em}
+.ohlc-box strong{font-size:13px}
 .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;padding:14px}
 .metric{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:11px;min-width:0}
 .metric span{display:block;font-size:10px;color:var(--muted);margin-bottom:4px}
@@ -119,4 +124,5 @@ footer{display:flex;justify-content:space-between;gap:10px;padding:18px 4px 30px
 @media(max-width:430px){
   .index-grid{grid-template-columns:1fr 1fr}.price{font-size:28px}.signal{min-width:92px;font-size:10px}
   .levels-grid{grid-template-columns:1fr 1fr}.two-col,.depth-grid{grid-template-columns:1fr}
+  .ohlc-row{grid-template-columns:repeat(2,1fr)}
 }
