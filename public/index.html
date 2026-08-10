@@ -42,12 +42,18 @@
         <button id="searchButton" onclick="searchStock()">🔎 Search</button>
       </div>
       <div class="search-note">Search covers NSE + BSE equity instruments.</div>
+      <div class="tool-row">
+        <button id="scannerButton" class="tool-btn" onclick="runScanner()">🔍 Scan Market</button>
+        <button id="journalButton" class="tool-btn" onclick="loadJournal()">📒 Signal Journal</button>
+      </div>
     </section>
+
+    <section id="tools" class="result-area"></section>
 
     <section id="result" class="result-area"></section>
 
     <footer>
-      <span>Dharmrajsinh Live Market V7.4</span>
+      <span>Dharmrajsinh Live Market V7.5</span>
       <span>Read-only analysis • Not an order execution system</span>
     </footer>
   </main>
