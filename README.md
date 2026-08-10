@@ -20,6 +20,10 @@ Mobile-first NSE + BSE equity analysis dashboard using the Upstox API.
 - Volume ratio + multi-candle volume trend (accumulation/distribution)
 - Multi-indicator confluence score (how many independent signals agree)
 - NIFTY 50 market-breadth filter — downgrades "strong" signals that fight the index trend
+- India VIX volatility-adjusted stop-loss/target distance and confidence
+- Opening Range Breakout (ORB) detection and score input
+- Signal accuracy tracking (trade journal with auto win/loss tracking and win rate)
+- Market scanner across the local watchlist
 - Technical confirmation
 - AI-style score and confidence
 - BUY / STRONG BUY / BREAKOUT BUY / WAIT / SELL / STRONG SELL / BREAKDOWN SELL / EXIT
@@ -69,6 +73,16 @@ The Upstox Market Data Feed V3 is the official streaming option if a true tick-b
 ## No order execution
 
 This version is an analysis/read-only dashboard. It does not place, modify or cancel orders.
+
+
+
+## V7.5.1 additions
+
+- **Signal accuracy tracking (trade journal)**: every actionable signal (BUY/STRONG BUY/BREAKOUT BUY/SELL/STRONG SELL/BREAKDOWN SELL) is logged once, and a background check every 60s compares the live price against target1/target2/stop-loss to close it out as a win or loss. `/api/journal` returns win rate and history. File-backed (`data/signals-journal.json`), best-effort — never blocks analysis if the disk isn't writable.
+- **India VIX-adjusted risk**: stop-loss/target distance now widens automatically when VIX is high (≥18) and tightens when VIX is low (≤11); confidence score also adjusts for volatility regime.
+- **Opening Range Breakout (ORB)**: computes the first 15 minutes' high/low of the trading session and flags a confirmed breakout/breakdown as an extra confluence vote and score input.
+- **Market scanner**: `/api/scanner` scans the local watchlist (`stocks.json`) with limited concurrency and returns only stocks with a live actionable signal, sorted by AI score. Optional `?symbols=RELIANCE,TCS` to scan a subset.
+- **Frontend**: added Scan Market and Signal Journal buttons, a Volatility & Opening Range card, and win-rate/journal history display.
 
 ## V7.5 changes
 
