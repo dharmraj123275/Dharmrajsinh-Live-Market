@@ -108,6 +108,11 @@ async function loadIndexes() {
           ${item.change >= 0 ? "+" : ""}${formatNumber(item.change)}
           (${item.changePercent >= 0 ? "+" : ""}${formatNumber(item.changePercent)}%)
         </div>
+        <div class="index-ohlc">
+          <span>O ₹${formatNumber(item.open)}</span>
+          <span>H ₹${formatNumber(item.high)}</span>
+          <span>L ₹${formatNumber(item.low)}</span>
+        </div>
         <div class="index-meta">Prev close ₹${formatNumber(item.previousClose)} • ATP ₹${formatNumber(item.averageTradePrice)}</div>
       </div>
     `).join("");
@@ -343,6 +348,15 @@ function level(title, value) {
   return `<div class="level"><span>${escapeHtml(title)}</span><strong>${isText ? escapeHtml(value) : `₹${formatNumber(value)}`}</strong></div>`;
 }
 
+function gapText(open, prevClose) {
+  const o = Number(open);
+  const p = Number(prevClose);
+  if (!Number.isFinite(o) || !Number.isFinite(p) || p === 0) return "—";
+  const gapPercent = ((o - p) / p) * 100;
+  const label = gapPercent > 0.1 ? "GAP UP" : gapPercent < -0.1 ? "GAP DOWN" : "FLAT";
+  return `${label} ${gapPercent >= 0 ? "+" : ""}${formatNumber(gapPercent)}%`;
+}
+
 function renderAnalysis(data) {
   const result = document.getElementById("result");
   const signal = data.signal || "WAIT";
@@ -389,6 +403,12 @@ function renderAnalysis(data) {
           </div>
           <div class="live-label">● LIVE ANALYSIS</div>
         </div>
+        <div class="ohlc-row">
+          <div class="ohlc-box"><span>Open</span><strong>₹${formatNumber(data.open)}</strong></div>
+          <div class="ohlc-box"><span>High</span><strong>₹${formatNumber(data.high)}</strong></div>
+          <div class="ohlc-box"><span>Low</span><strong>₹${formatNumber(data.low)}</strong></div>
+          <div class="ohlc-box"><span>Prev Close</span><strong>₹${formatNumber(data.previousClose)}</strong></div>
+        </div>
       </div>
 
       <div class="grid">
@@ -396,7 +416,9 @@ function renderAnalysis(data) {
         ${metric("Trend", data.trend)}
         ${metric("Confidence", `${formatNumber(data.confidence)}%`)}
         ${metric("Trade Quality", data.tradeQuality)}
-        ${metric("Previous Close", `₹${formatNumber(data.previousClose)}`)}
+        ${metric("Day Range", `₹${formatNumber(data.low)} - ₹${formatNumber(data.high)}`)}
+        ${metric("Gap vs Prev Close", gapText(data.open, data.previousClose))}
+        ${metric("Circuit Range", `₹${formatNumber(data.lowerCircuit)} - ₹${formatNumber(data.upperCircuit)}`)}
         ${metric("Average Trade Price", `₹${formatNumber(data.averageTradePrice)}`)}
         ${metric("Volume", formatCompact(data.volume))}
         ${metric("OI", formatCompact(data.oi))}
