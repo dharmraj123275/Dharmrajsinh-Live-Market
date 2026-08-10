@@ -1,5 +1,5 @@
 // ============================================================
-// DHARMRAJSINH LIVE MARKET V7.4.1 - FRONTEND
+// DHARMRAJSINH LIVE MARKET V7.5 - FRONTEND
 // ============================================================
 
 let selected = null;
@@ -440,6 +440,10 @@ function renderAnalysis(data) {
           ${metric("RSI", tech.rsiSignal || "NEUTRAL")}
           ${metric("Volume Confirmed", tech.volumeConfirmed ? "YES" : "NO")}
           ${metric("Volume Ratio", tech.volumeRatio == null ? "N/A" : `${formatNumber(tech.volumeRatio)}x`)}
+          ${metric("Volume Trend", tech.volumeTrend || "NEUTRAL")}
+          ${metric("MACD Trend", tech.macdTrend || "NEUTRAL")}
+          ${metric("MACD Crossover", tech.macdCrossover || "NONE")}
+          ${metric("Candle Pattern", (tech.candlePattern || "NONE").replace(/_/g, " "))}
           ${metric("Buyers Confirmed", tech.buyersConfirmed ? "YES" : "NO")}
           ${metric("Sellers Confirmed", tech.sellersConfirmed ? "YES" : "NO")}
           ${metric("EMA 20", `₹${formatNumber(data.technical?.ema20)}`)}
@@ -448,6 +452,35 @@ function renderAnalysis(data) {
           ${metric("RSI Value", formatNumber(data.technical?.rsi))}
         </div>
         <div class="reason" style="margin-top:10px"><strong>⚡ ${escapeHtml(tech.confirmationStatus || "WAITING FOR CONFIRMATION")}</strong></div>
+      </div>
+
+      <div class="section-card">
+        <h3>⏱ Multi-Timeframe &amp; Market Breadth</h3>
+        <div class="tech-grid">
+          ${metric("Daily Trend", tech.dailyTrend || "NEUTRAL")}
+          ${metric("Intraday Trend", tech.intradayTrend || "NEUTRAL")}
+          ${metric("Timeframes Aligned", tech.timeframeAligned ? "YES ✅" : "NO")}
+          ${metric("Confluence", tech.confluenceTotal ? `${tech.confluenceCount}/${tech.confluenceTotal} (${tech.confluenceDirection || "NEUTRAL"})` : "N/A")}
+          ${metric("Nifty Trend", tech.marketBreadthTrend || "NEUTRAL")}
+          ${metric("Daily EMA 20", `₹${formatNumber(data.technical?.dailyEma20)}`)}
+          ${metric("Daily EMA 50", `₹${formatNumber(data.technical?.dailyEma50)}`)}
+          ${metric("Daily RSI", formatNumber(data.technical?.dailyRsi))}
+        </div>
+        ${tech.timeframeAligned
+          ? `<div class="reason" style="margin-top:10px"><strong>✅ Daily and intraday trend agree — higher-confidence setup.</strong></div>`
+          : `<div class="reason" style="margin-top:10px">⚠ Daily and intraday trend do not fully agree — treat as lower confidence.</div>`
+        }
+      </div>
+
+      <div class="section-card">
+        <h3>🌡 Volatility &amp; Opening Range</h3>
+        <div class="tech-grid">
+          ${metric("India VIX", tech.vixValue == null ? "N/A" : formatNumber(tech.vixValue))}
+          ${metric("Volatility", tech.vixLevel || "NORMAL")}
+          ${metric("ORB High", tech.orbHigh == null ? "N/A" : `₹${formatNumber(tech.orbHigh)}`)}
+          ${metric("ORB Low", tech.orbLow == null ? "N/A" : `₹${formatNumber(tech.orbLow)}`)}
+          ${metric("ORB Bias", tech.orbAvailable ? (tech.orbBias || "NEUTRAL") : "NOT FORMED YET")}
+        </div>
       </div>
 
       <div class="section-card">
@@ -482,6 +515,145 @@ function renderAnalysis(data) {
       </div>
     </div>
   `;
+}
+
+// ============================================================
+// MARKET SCANNER
+// ============================================================
+
+async function runScanner() {
+  const tools = document.getElementById("tools");
+  const button = document.getElementById("scannerButton");
+  if (button) button.disabled = true;
+
+  tools.innerHTML = `<div class="loading-card">🔍 Scanning watchlist for live signals...</div>`;
+
+  try {
+    const data = await fetchJson(`/api/scanner?_=${Date.now()}`);
+    const results = Array.isArray(data.results) ? data.results : [];
+
+    if (!results.length) {
+      tools.innerHTML = `
+        <div class="section-card">
+          <h3>🔍 Market Scanner</h3>
+          <div class="reason">No actionable BUY/SELL signals right now across ${data.scannedCount || 0} watchlist stocks. Try again in a bit.</div>
+          <button class="tool-btn" style="margin-top:10px" onclick="closeTools()">Close</button>
+        </div>
+      `;
+      return;
+    }
+
+    tools.innerHTML = `
+      <div class="section-card">
+        <h3>🔍 Market Scanner — ${results.length} signal(s) of ${data.scannedCount} scanned</h3>
+        ${results.map(r => `
+          <div class="stock-result">
+            <div>
+              <strong>${escapeHtml(r.symbol)}</strong>
+              <span class="signal-pill ${signalClass(r.signal)}">${escapeHtml(r.signal)}</span>
+              <div>${escapeHtml(r.name)} • ₹${formatNumber(r.price)}</div>
+              <small>AI Score ${formatNumber(r.aiScore, 0)}/100 • R:R 1:${formatNumber(r.riskReward)}</small>
+            </div>
+            <button class="analyze-btn" onclick='selectScannerStock(${JSON.stringify(r).replace(/'/g, "&#39;")})'>
+              📊 View
+            </button>
+          </div>
+        `).join("")}
+        <button class="tool-btn" style="margin-top:10px" onclick="closeTools()">Close</button>
+      </div>
+    `;
+  } catch (error) {
+    if (error.status === 401) {
+      tools.innerHTML = `
+        <div class="error-card">
+          🔐 Upstox token expired/missing. Set <strong>UPSTOX_ACCESS_TOKEN</strong> on Render or use
+          <a href="/login">Upstox Login</a>.
+        </div>
+      `;
+    } else {
+      tools.innerHTML = `<div class="error-card">⚠ Scanner error: ${escapeHtml(error.message)}</div>`;
+    }
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function selectScannerStock(item) {
+  selected = {
+    symbol: item.symbol || "",
+    name: item.name || item.symbol || "",
+    exchange: item.exchange || "",
+    segment: "EQ",
+    instrument: item.instrument,
+    isin: "",
+    source: "scanner"
+  };
+
+  closeTools();
+  stopLiveTimer();
+  liveRequestId++;
+  if (liveController) {
+    try { liveController.abort(); } catch (_) {}
+  }
+
+  loadLiveAnalysis();
+  liveTimer = setInterval(loadLiveAnalysis, 5000);
+  document.getElementById("result")?.scrollIntoView({ behavior: "smooth" });
+}
+
+// ============================================================
+// SIGNAL JOURNAL (ACCURACY TRACKING)
+// ============================================================
+
+async function loadJournal() {
+  const tools = document.getElementById("tools");
+  const button = document.getElementById("journalButton");
+  if (button) button.disabled = true;
+
+  tools.innerHTML = `<div class="loading-card">📒 Loading signal journal...</div>`;
+
+  try {
+    const data = await fetchJson(`/api/journal?limit=25&_=${Date.now()}`);
+    const stats = data.stats || {};
+    const entries = Array.isArray(data.entries) ? data.entries : [];
+
+    const entriesHtml = entries.length
+      ? entries.map(e => `
+        <div class="stock-result">
+          <div>
+            <strong>${escapeHtml(e.symbol)}</strong>
+            <span class="signal-pill ${signalClass(e.signal)}">${escapeHtml(e.signal)}</span>
+            <div>Entry ₹${formatNumber(e.entry)} → T1 ₹${formatNumber(e.target1)} / SL ₹${formatNumber(e.stopLoss)}</div>
+            <small>${e.status === "OPEN" ? "🟡 OPEN" : `⚪ ${escapeHtml(e.outcome || "CLOSED")}`} • ${new Date(e.createdAt).toLocaleString("en-IN")}</small>
+          </div>
+        </div>
+      `).join("")
+      : `<div class="reason">No signals logged yet — they get recorded automatically as you analyze stocks.</div>`;
+
+    tools.innerHTML = `
+      <div class="section-card">
+        <h3>📒 Signal Journal — Accuracy Tracking</h3>
+        <div class="tech-grid">
+          ${metric("Total Signals", stats.totalSignals ?? 0)}
+          ${metric("Open", stats.open ?? 0)}
+          ${metric("Closed", stats.closed ?? 0)}
+          ${metric("Wins", stats.wins ?? 0)}
+          ${metric("Losses", stats.losses ?? 0)}
+          ${metric("Win Rate", stats.winRate == null ? "N/A" : `${formatNumber(stats.winRate)}%`)}
+        </div>
+        <div style="margin-top:12px">${entriesHtml}</div>
+        <button class="tool-btn" style="margin-top:10px" onclick="closeTools()">Close</button>
+      </div>
+    `;
+  } catch (error) {
+    tools.innerHTML = `<div class="error-card">⚠ Journal error: ${escapeHtml(error.message)}</div>`;
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function closeTools() {
+  document.getElementById("tools").innerHTML = "";
 }
 
 // ============================================================
