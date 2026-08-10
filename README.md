@@ -76,6 +76,12 @@ This version is an analysis/read-only dashboard. It does not place, modify or ca
 
 
 
+## V7.5.2 additions
+
+- **Open / High / Low / Prev Close now shown for every stock** in a dedicated OHLC bar right under the live price, and Open/High/Low added to the NIFTY/SENSEX/MIDCPNIFTY/VIX index cards too (the data was already returned by the API but wasn't displayed).
+- Added **Gap vs Prev Close** (gap-up/gap-down %) — useful for spotting gap-and-go setups at market open.
+- Added **Circuit Range** (upper/lower circuit limit) display — helps avoid placing an entry too close to a circuit band.
+
 ## V7.5.1 additions
 
 - **Signal accuracy tracking (trade journal)**: every actionable signal (BUY/STRONG BUY/BREAKOUT BUY/SELL/STRONG SELL/BREAKDOWN SELL) is logged once, and a background check every 60s compares the live price against target1/target2/stop-loss to close it out as a win or loss. `/api/journal` returns win rate and history. File-backed (`data/signals-journal.json`), best-effort — never blocks analysis if the disk isn't writable.
