@@ -41,6 +41,14 @@ button{cursor:pointer}
 .neutral{color:var(--amber)}
 .index-meta{font-size:10px;color:var(--muted);margin-top:8px}
 .search-panel{padding:14px;margin-bottom:14px}
+.tool-row{display:flex;gap:8px;margin-top:10px}
+.tool-btn{flex:1;border:1px solid #334155;border-radius:12px;padding:11px 10px;background:#1a2c47;color:#e2e8f0;font-weight:800;cursor:pointer}
+.tool-btn:active{opacity:.8}
+.signal-pill{display:inline-block;padding:3px 8px;border-radius:999px;font-size:10px;font-weight:800;margin-left:5px}
+.signal-pill.buy{background:#052e1a;color:#22c55e}
+.signal-pill.sell{background:#2e0505;color:#ef4444}
+.signal-pill.exit{background:#2e2005;color:#f59e0b}
+.signal-pill.hold{background:#24344b;color:#cbd5e1}
 .search-row{display:flex;gap:8px}
 .search-row input{flex:1;min-width:0;border:1px solid #334155;background:#f8fafc;color:#0f172a;border-radius:12px;padding:13px 14px;outline:none}
 .search-row button{border:0;border-radius:12px;padding:0 17px;background:var(--cyan);color:#04212a;font-weight:800}
