@@ -510,6 +510,50 @@ function buildMultiTimeframeTechnical(dailyCandles, intradayCandles, price) {
   };
 }
 
+// ------------------------------------------------------------
+// WEEKLY TREND (3rd timeframe — longer-term structural confirmation)
+// ------------------------------------------------------------
+
+function buildWeeklyTrend(weeklyCandles, price) {
+  const weekly = normalizeCandles(weeklyCandles);
+  const closes = weekly.map(c => c.close);
+  const p = num(price);
+
+  const wEma20 = ema(closes, 20);
+  const wEma50 = ema(closes, 50);
+  const wRsi = rsi(closes, 14);
+  const wMacd = macd(closes);
+
+  let trend = "NEUTRAL";
+  if (wEma20 != null && wEma50 != null) {
+    if (p > wEma20 && wEma20 > wEma50) trend = "BULLISH";
+    else if (p < wEma20 && wEma20 < wEma50) trend = "BEARISH";
+  }
+
+  return {
+    available: wEma20 != null && wEma50 != null,
+    trend,
+    ema20: wEma20,
+    ema50: wEma50,
+    rsi: wRsi,
+    macdTrend: wMacd.trend,
+    candleCount: weekly.length
+  };
+}
+
+// ------------------------------------------------------------
+// 52-WEEK HIGH/LOW
+// ------------------------------------------------------------
+
+function fiftyTwoWeekRange(dailyCandles) {
+  const daily = normalizeCandles(dailyCandles);
+  if (!daily.length) return { high: null, low: null, available: false };
+
+  const high = Math.max(...daily.map(c => c.high));
+  const low = Math.min(...daily.map(c => c.low));
+  return { high, low, available: true, candleCount: daily.length };
+}
+
 module.exports = {
   ema,
   emaSeries,
@@ -525,5 +569,7 @@ module.exports = {
   recentHigh,
   recentLow,
   buildTechnical,
-  buildMultiTimeframeTechnical
+  buildMultiTimeframeTechnical,
+  buildWeeklyTrend,
+  fiftyTwoWeekRange
 };
