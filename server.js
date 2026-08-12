@@ -1,5 +1,5 @@
 // ============================================================
-// DHARMRAJSINH LIVE MARKET V7.5
+// DHARMRAJSINH LIVE MARKET V7.6
 // COMPLETE SERVER.JS
 //
 // NSE + BSE EQUITY SCANNER
@@ -654,7 +654,20 @@ async function getCandlePack(instrument) {
       "days",
       "1",
       indiaDateString(),
-      dateMinusDays(220)
+      dateMinusDays(370) // covers a full 52-week range for high/low + daily EMA50
+    );
+  } catch (error) {
+    if (isUnauthorized(error)) throw error;
+  }
+
+  let weekly = [];
+  try {
+    weekly = await upstox.getHistoricalCandles(
+      instrument,
+      "weeks",
+      "1",
+      indiaDateString(),
+      dateMinusDays(730) // ~2 years of weekly candles, enough for weekly EMA20/50
     );
   } catch (error) {
     if (isUnauthorized(error)) throw error;
@@ -662,7 +675,8 @@ async function getCandlePack(instrument) {
 
   const pack = {
     intraday: normalizeCandles(intraday),
-    daily: normalizeCandles(daily)
+    daily: normalizeCandles(daily),
+    weekly: normalizeCandles(weekly)
   };
 
   return cacheSet(technicalCache, instrument, pack);
@@ -793,6 +807,109 @@ function calculateORB(intradayCandles, rangeMinutes = 15) {
     breakdownConfirmed,
     bias: breakoutConfirmed ? "BULLISH" : breakdownConfirmed ? "BEARISH" : "NEUTRAL",
     formedAt: new Date(rangeEndMs).toISOString()
+  };
+}
+
+// ============================================================
+// SECTOR RELATIVE STRENGTH
+// Compares the stock's own recent trend/return against its sector index
+// (e.g. NIFTY BANK, NIFTY IT). A stock outperforming a bullish sector, or
+// holding up while its sector is weak, is a meaningfully different signal
+// than the same technicals in isolation. Requires the sector name Upstox
+// returns in fundamentals — falls back to unavailable if it can't be
+// confidently matched to a known sector index.
+// ============================================================
+
+const SECTOR_INDEX_MAP = [
+  { keywords: ["bank"], instrument: "NSE_INDEX|Nifty Bank", label: "Nifty Bank" },
+  { keywords: ["information technology", "it services", "software", "tech"], instrument: "NSE_INDEX|Nifty IT", label: "Nifty IT" },
+  { keywords: ["auto", "automobile"], instrument: "NSE_INDEX|Nifty Auto", label: "Nifty Auto" },
+  { keywords: ["pharma", "drug", "healthcare"], instrument: "NSE_INDEX|Nifty Pharma", label: "Nifty Pharma" },
+  { keywords: ["fmcg", "consumer goods", "fast moving consumer"], instrument: "NSE_INDEX|Nifty FMCG", label: "Nifty FMCG" },
+  { keywords: ["metal", "steel", "mining"], instrument: "NSE_INDEX|Nifty Metal", label: "Nifty Metal" },
+  { keywords: ["realty", "real estate"], instrument: "NSE_INDEX|Nifty Realty", label: "Nifty Realty" },
+  { keywords: ["oil", "gas", "energy", "power"], instrument: "NSE_INDEX|Nifty Energy", label: "Nifty Energy" },
+  { keywords: ["financial services", "nbfc", "insurance"], instrument: "NSE_INDEX|Nifty Financial Services", label: "Nifty Financial Services" },
+  { keywords: ["infra", "construction", "cement"], instrument: "NSE_INDEX|Nifty Infrastructure", label: "Nifty Infra" },
+  { keywords: ["media", "entertainment"], instrument: "NSE_INDEX|Nifty Media", label: "Nifty Media" }
+];
+
+function matchSectorIndex(sectorText) {
+  const text = String(sectorText || "").toLowerCase().trim();
+  if (!text) return null;
+  return SECTOR_INDEX_MAP.find(s => s.keywords.some(k => text.includes(k))) || null;
+}
+
+async function getSectorStrength(sectorText, stockDaily) {
+  const match = matchSectorIndex(sectorText);
+  if (!match) return { available: false };
+
+  const cacheKey = `SECTOR_${match.instrument}`;
+  const cached = cacheGet(marketBreadthCache, cacheKey, BREADTH_CACHE_MS);
+  if (cached) return applySectorComparison(cached, stockDaily);
+
+  try {
+    const quote = await getLiveQuote(match.instrument);
+    const price = num(quote.last_price);
+
+    let daily = [];
+    try {
+      daily = await upstox.getHistoricalCandles(
+        match.instrument,
+        "days",
+        "1",
+        indiaDateString(),
+        dateMinusDays(60)
+      );
+    } catch (_) { /* best-effort */ }
+
+    const normalized = technical.normalizeCandles(daily);
+    const closes = normalized.map(c => c.close);
+    const ema20 = technical.ema(closes, 20);
+    const ema50 = technical.ema(closes, 50);
+
+    let trend = "NEUTRAL";
+    if (ema20 != null && ema50 != null) {
+      if (price > ema20 && ema20 > ema50) trend = "BULLISH";
+      else if (price < ema20 && ema20 < ema50) trend = "BEARISH";
+    }
+
+    const sectorData = cacheSet(marketBreadthCache, cacheKey, {
+      label: match.label,
+      trend,
+      candles: normalized,
+      available: normalized.length >= 20
+    });
+
+    return applySectorComparison(sectorData, stockDaily);
+  } catch (error) {
+    return { available: false };
+  }
+}
+
+function applySectorComparison(sectorData, stockDaily) {
+  if (!sectorData.available) return { available: false, label: sectorData.label };
+
+  const lookback = 20;
+  const sectorCandles = sectorData.candles.slice(-lookback);
+  const stockCandles = (stockDaily || []).slice(-lookback);
+
+  let relativeStrength = null;
+  let performance = "NEUTRAL";
+
+  if (sectorCandles.length >= 2 && stockCandles.length >= 2) {
+    const sectorReturn = ((sectorCandles.at(-1).close - sectorCandles[0].close) / sectorCandles[0].close) * 100;
+    const stockReturn = ((stockCandles.at(-1).close - stockCandles[0].close) / stockCandles[0].close) * 100;
+    relativeStrength = round2(stockReturn - sectorReturn);
+    performance = relativeStrength > 1 ? "OUTPERFORMING" : relativeStrength < -1 ? "UNDERPERFORMING" : "IN_LINE";
+  }
+
+  return {
+    available: true,
+    label: sectorData.label,
+    sectorTrend: sectorData.trend,
+    relativeStrength,
+    performance
   };
 }
 
@@ -1112,7 +1229,11 @@ function buildSignal({
   instrument,
   marketBreadth = { trend: "NEUTRAL", available: false },
   vix = { level: "NORMAL", available: false },
-  orb = { available: false }
+  orb = { available: false },
+  lowerCircuit = null,
+  upperCircuit = null,
+  weeklyTrend = { available: false, trend: "NEUTRAL" },
+  sectorStrength = { available: false }
 }) {
   const p = num(price);
   const range = Math.max(num(high) - num(low), p * 0.001);
@@ -1146,6 +1267,28 @@ function buildSignal({
   const breadthTrend = marketBreadth.trend || "NEUTRAL";
   const orbBias = orb.available ? orb.bias : "NEUTRAL";
   const vixLevel = vix.level || "NORMAL";
+  const weeklyTrendValue = weeklyTrend.available ? weeklyTrend.trend : "NEUTRAL";
+
+  // True 3-timeframe alignment: weekly (structural), daily (trend) and
+  // intraday (timing) all agreeing is the single strongest confirmation
+  // this system can produce.
+  const threeTimeframeAligned = weeklyTrend.available &&
+    weeklyTrendValue !== "NEUTRAL" &&
+    weeklyTrendValue === technicalData.dailyTrend &&
+    weeklyTrendValue === technicalData.intradayTrend;
+
+  const sectorAligned = sectorStrength.available &&
+    (sectorStrength.performance === "OUTPERFORMING" || sectorStrength.performance === "IN_LINE") &&
+    sectorStrength.sectorTrend !== "NEUTRAL";
+  // Don't let a stock go STRONG BUY while it's meaningfully lagging a
+  // bullish sector (weak relative strength), or STRONG SELL while it's
+  // outperforming a bearish sector (relative resilience).
+  const sectorBullishOk = !(sectorStrength.available && sectorStrength.performance === "UNDERPERFORMING");
+  const sectorBearishOk = !(sectorStrength.available && sectorStrength.performance === "OUTPERFORMING");
+
+  // Weekly (structural) trend must not directly contradict a STRONG grade.
+  const weeklyBullishOk = !weeklyTrend.available || weeklyTrendValue !== "BEARISH";
+  const weeklyBearishOk = !weeklyTrend.available || weeklyTrendValue !== "BULLISH";
 
   const aiScore = Math.round(clamp(
     50 +
@@ -1155,7 +1298,9 @@ function buildSignal({
       (fundamentalScore - 50) * 0.10 +
       (confluenceDirection === "BULLISH" ? confluenceRatio * 8 : confluenceDirection === "BEARISH" ? -confluenceRatio * 8 : 0) +
       (timeframeAligned ? (technicalData.dailyTrend === "BULLISH" ? 6 : -6) : 0) +
-      (orbBias === "BULLISH" ? 6 : orbBias === "BEARISH" ? -6 : 0),
+      (orbBias === "BULLISH" ? 6 : orbBias === "BEARISH" ? -6 : 0) +
+      (threeTimeframeAligned ? (weeklyTrendValue === "BULLISH" ? 8 : -8) : 0) +
+      (sectorStrength.available ? (sectorStrength.relativeStrength > 0 ? Math.min(sectorStrength.relativeStrength, 8) : Math.max(sectorStrength.relativeStrength, -8)) * 0.5 : 0),
     0,
     100
   ));
@@ -1180,6 +1325,18 @@ function buildSignal({
   const patternBullishOk = patternBias !== "BEARISH";
   const patternBearishOk = patternBias !== "BULLISH";
 
+  // A stock pinned near its circuit limit has little room left to move and
+  // can freeze mid-trade — a STRONG grade here would be overconfident.
+  const nearUpperCircuit = upperCircuit != null && price >= upperCircuit * 0.995;
+  const nearLowerCircuit = lowerCircuit != null && price <= lowerCircuit * 1.005;
+
+  // Don't grade a signal STRONG off a thin sample of candles — the
+  // multi-timeframe/MACD/Bollinger math needs enough history to mean
+  // anything, otherwise it's a coin flip dressed up as high confidence.
+  const dailyCount = technicalData.dailyCandleCount ?? technicalData.candleCount ?? 0;
+  const intradayCount = technicalData.candleCount ?? 0;
+  const dataSufficient = dailyCount >= 30 && intradayCount >= 20;
+
   const breakoutConfirmed =
     p > levels.breakoutLevel &&
     num(close) >= num(open) &&
@@ -1201,6 +1358,10 @@ function buildSignal({
     breadthBullishOk &&
     macdBullishOk &&
     patternBullishOk &&
+    !nearUpperCircuit &&
+    dataSufficient &&
+    weeklyBullishOk &&
+    sectorBullishOk &&
     (technicalData.confluenceTotal == null || confluenceDirection !== "BEARISH") &&
     levels.buyRR1 >= 1.5;
 
@@ -1211,6 +1372,7 @@ function buildSignal({
     buyersConfirmed &&
     newsBullish &&
     patternBullishOk &&
+    !nearUpperCircuit &&
     levels.buyRR1 >= 1.5;
 
   const strongSell =
@@ -1222,6 +1384,10 @@ function buildSignal({
     breadthBearishOk &&
     macdBearishOk &&
     patternBearishOk &&
+    !nearLowerCircuit &&
+    dataSufficient &&
+    weeklyBearishOk &&
+    sectorBearishOk &&
     (technicalData.confluenceTotal == null || confluenceDirection !== "BULLISH") &&
     levels.sellRR1 >= 1.5;
 
@@ -1232,6 +1398,7 @@ function buildSignal({
     sellersConfirmed &&
     newsBearish &&
     patternBearishOk &&
+    !nearLowerCircuit &&
     levels.sellRR1 >= 1.5;
 
   let signal = "WAIT";
@@ -1379,6 +1546,17 @@ function buildSignal({
       orbHigh: orb.orbHigh ?? null,
       orbLow: orb.orbLow ?? null,
       orbBias,
+      nearUpperCircuit,
+      nearLowerCircuit,
+      dataSufficient,
+      weeklyTrend: weeklyTrendValue,
+      weeklyAvailable: Boolean(weeklyTrend.available),
+      threeTimeframeAligned,
+      sectorLabel: sectorStrength.label || null,
+      sectorTrend: sectorStrength.sectorTrend || "NEUTRAL",
+      sectorPerformance: sectorStrength.performance || "NEUTRAL",
+      sectorRelativeStrength: sectorStrength.relativeStrength ?? null,
+      sectorAvailable: Boolean(sectorStrength.available),
       buyersConfirmed: depth.buyersConfirmed,
       sellersConfirmed: depth.sellersConfirmed,
       confirmationStatus
@@ -1403,9 +1581,17 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
   const open = num(ohlc.open);
   const high = num(ohlc.high);
   const low = num(ohlc.low);
-  const previousClose = num(ohlc.close);
-  const netChange = num(quote.net_change, price - previousClose);
-  const changePercent = previousClose > 0 ? (netChange / previousClose) * 100 : 0;
+
+  // BUG FIX: Upstox's Full Market Quote `ohlc.close` field mirrors the
+  // current live price during market hours (confirmed against Upstox's own
+  // API docs example, where ohlc.close == last_price) — it is NOT
+  // yesterday's close, despite the field name. Using it directly made
+  // "Previous Close", net change %, and the circuit-range display all look
+  // wrong/inconsistent. `net_change` is computed correctly server-side by
+  // Upstox, so previousClose = price - net_change is the reliable source.
+  let previousClose = Number.isFinite(quote.net_change)
+    ? num(price - quote.net_change)
+    : 0;
 
   if (price <= 0) {
     const err = new Error("Live price unavailable.");
@@ -1420,8 +1606,21 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
     if (isUnauthorized(error)) throw error;
   }
 
+  // Fallback: if net_change wasn't usable, use the last completed daily
+  // candle's close (yesterday's session) instead of the unreliable ohlc.close.
+  if (!(previousClose > 0) && candlePack.daily.length >= 2) {
+    const dailySorted = technical.normalizeCandles(candlePack.daily);
+    previousClose = num(dailySorted.at(-2)?.close, price);
+  } else if (!(previousClose > 0)) {
+    previousClose = price; // last resort — avoids a divide-by-zero / fake 0% change
+  }
+
+  const netChange = num(quote.net_change, price - previousClose);
+  const changePercent = previousClose > 0 ? (netChange / previousClose) * 100 : 0;
+
   const intraday = candlePack.intraday;
   const daily = candlePack.daily;
+  const weekly = candlePack.weekly;
 
   // Multi-timeframe: daily candles set the structural trend (EMA20/50, MACD,
   // RSI, Bollinger), intraday 1-min candles set the live entry timing
@@ -1430,6 +1629,9 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
   const technicalData = (daily.length >= 20 && intraday.length >= 20)
     ? technical.buildMultiTimeframeTechnical(daily, intraday, price)
     : technical.buildTechnical(intraday.length >= 20 ? intraday : daily, price);
+
+  const weeklyTrend = technical.buildWeeklyTrend(weekly, price);
+  const fiftyTwoWeek = technical.fiftyTwoWeekRange(daily);
 
   const marketBreadth = await getMarketBreadth();
   const vix = await getVixLevel();
@@ -1452,6 +1654,8 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
     getNewsAnalysis(instrument),
     getFundamentalAnalysis(instrument)
   ]);
+
+  const sectorStrength = await getSectorStrength(fundamentals.sector, daily);
 
   const levels = calculateLevels({
     price,
@@ -1480,7 +1684,11 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
     instrument,
     marketBreadth,
     vix,
-    orb
+    orb,
+    weeklyTrend,
+    sectorStrength,
+    lowerCircuit: quote.lower_circuit_limit > 0 ? num(quote.lower_circuit_limit) : null,
+    upperCircuit: quote.upper_circuit_limit > 0 ? num(quote.upper_circuit_limit) : null
   });
 
   const lastTradeTime = quote.last_trade_time
@@ -1504,8 +1712,8 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
     averageTradePrice: round2(quote.average_price),
     volume: num(quote.volume),
     oi: num(quote.oi),
-    lowerCircuit: round2(quote.lower_circuit_limit),
-    upperCircuit: round2(quote.upper_circuit_limit),
+    lowerCircuit: quote.lower_circuit_limit > 0 ? round2(quote.lower_circuit_limit) : null,
+    upperCircuit: quote.upper_circuit_limit > 0 ? round2(quote.upper_circuit_limit) : null,
     lastTradeTime,
     support: round2(support),
     resistance: round2(resistance),
@@ -1547,6 +1755,12 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
     marketBreadth,
     vix,
     orb,
+    fiftyTwoWeek: {
+      high: fiftyTwoWeek.available ? round2(fiftyTwoWeek.high) : null,
+      low: fiftyTwoWeek.available ? round2(fiftyTwoWeek.low) : null,
+      available: fiftyTwoWeek.available
+    },
+    sectorStrength,
     marketDepth: depth,
     news,
     fundamentals,
@@ -1766,7 +1980,14 @@ async function analyzeIndex(item) {
   }
 
   const price = num(quote.last_price);
-  const close = num(quote.ohlc?.close);
+
+  // Same bug as analyzeInstrument had: Upstox's ohlc.close mirrors the live
+  // price during market hours instead of yesterday's close. Use net_change
+  // (which Upstox computes correctly server-side) as the reliable source.
+  const previousCloseRaw = Number.isFinite(quote.net_change)
+    ? num(price - quote.net_change)
+    : num(quote.ohlc?.close);
+  const close = previousCloseRaw > 0 ? previousCloseRaw : price;
   const change = num(quote.net_change, price - close);
   const changePct = close > 0 ? (change / close) * 100 : 0;
 
@@ -1895,7 +2116,7 @@ app.get("/api/health", (req, res) => {
   res.json({
     success: true,
     app: "Dharmrajsinh Live Market",
-    version: "7.5.0",
+    version: "7.6.0",
     serverTime: new Date().toISOString(),
     marketOpen: marketOpenNow(),
     upstoxToken: hasAccessToken() ? "AVAILABLE" : "MISSING",
@@ -1917,6 +2138,10 @@ app.get("/api/health", (req, res) => {
       "Opening Range Breakout (ORB)",
       "Signal Accuracy Tracking (Trade Journal)",
       "Market Scanner (Watchlist)",
+      "52-Week High/Low",
+      "Weekly Timeframe (3-TF Alignment)",
+      "Sector Relative Strength",
+      "Position Size Calculator",
       "Fundamental Analysis",
       "News Impact",
       "Auto-Retry on API Failures",
@@ -1953,7 +2178,7 @@ app.use((error, req, res, next) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("================================================");
-  console.log("DHARMRAJSINH LIVE MARKET V7.5");
+  console.log("DHARMRAJSINH LIVE MARKET V7.6");
   console.log("================================================");
   console.log(`Server running on port ${PORT}`);
   console.log(`Upstox token: ${hasAccessToken() ? "AVAILABLE" : "MISSING"}`);
