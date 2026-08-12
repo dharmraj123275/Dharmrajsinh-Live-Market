@@ -108,12 +108,6 @@ async function loadIndexes() {
           ${item.change >= 0 ? "+" : ""}${formatNumber(item.change)}
           (${item.changePercent >= 0 ? "+" : ""}${formatNumber(item.changePercent)}%)
         </div>
-        <div class="index-ohlc">
-          <span>O ₹${formatNumber(item.open)}</span>
-          <span>H ₹${formatNumber(item.high)}</span>
-          <span>L ₹${formatNumber(item.low)}</span>
-        </div>
-        <div class="index-meta">Prev close ₹${formatNumber(item.previousClose)} • ATP ₹${formatNumber(item.averageTradePrice)}</div>
       </div>
     `).join("");
     document.getElementById("indexUpdated").textContent = new Date().toLocaleTimeString("en-IN");
@@ -362,6 +356,7 @@ function renderAnalysis(data) {
   const signal = data.signal || "WAIT";
   const depth = data.marketDepth || {};
   const tech = data.technicalConfirmation || {};
+  const sector = data.sectorStrength || {};
   const fundamentals = data.fundamentals || {};
   const news = data.news || {};
 
@@ -417,8 +412,9 @@ function renderAnalysis(data) {
         ${metric("Confidence", `${formatNumber(data.confidence)}%`)}
         ${metric("Trade Quality", data.tradeQuality)}
         ${metric("Day Range", `₹${formatNumber(data.low)} - ₹${formatNumber(data.high)}`)}
+        ${metric("52-Week Range", data.fiftyTwoWeek?.available ? `₹${formatNumber(data.fiftyTwoWeek.low)} - ₹${formatNumber(data.fiftyTwoWeek.high)}` : "N/A")}
         ${metric("Gap vs Prev Close", gapText(data.open, data.previousClose))}
-        ${metric("Circuit Range", `₹${formatNumber(data.lowerCircuit)} - ₹${formatNumber(data.upperCircuit)}`)}
+        ${metric("Circuit Range", (data.lowerCircuit == null || data.upperCircuit == null) ? "N/A" : `₹${formatNumber(data.lowerCircuit)} - ₹${formatNumber(data.upperCircuit)}`)}
         ${metric("Average Trade Price", `₹${formatNumber(data.averageTradePrice)}`)}
         ${metric("Volume", formatCompact(data.volume))}
         ${metric("OI", formatCompact(data.oi))}
@@ -438,6 +434,21 @@ function renderAnalysis(data) {
           <span>RR T1: 1 : ${formatNumber(data.riskRewardTarget1)}</span>
           <span>RR T2: 1 : ${formatNumber(data.riskRewardTarget2)}</span>
         </div>
+      </div>
+
+      <div class="section-card">
+        <h3>🧮 Position Size Calculator</h3>
+        <div class="calc-row">
+          <div class="calc-field">
+            <span>Capital (₹)</span>
+            <input type="number" id="calcCapital" inputmode="decimal" placeholder="e.g. 100000" oninput="updatePositionSize()">
+          </div>
+          <div class="calc-field">
+            <span>Risk per trade (%)</span>
+            <input type="number" id="calcRisk" inputmode="decimal" placeholder="e.g. 1" value="1" oninput="updatePositionSize()">
+          </div>
+        </div>
+        <div id="calcResult" class="tech-grid" style="margin-top:10px"></div>
       </div>
 
       <div class="section-card">
@@ -477,21 +488,37 @@ function renderAnalysis(data) {
       </div>
 
       <div class="section-card">
-        <h3>⏱ Multi-Timeframe &amp; Market Breadth</h3>
+        <h3>⏱ Multi-Timeframe (Weekly + Daily + Intraday)</h3>
         <div class="tech-grid">
+          ${metric("Weekly Trend", tech.weeklyAvailable ? (tech.weeklyTrend || "NEUTRAL") : "N/A")}
           ${metric("Daily Trend", tech.dailyTrend || "NEUTRAL")}
           ${metric("Intraday Trend", tech.intradayTrend || "NEUTRAL")}
-          ${metric("Timeframes Aligned", tech.timeframeAligned ? "YES ✅" : "NO")}
+          ${metric("Daily+Intraday Aligned", tech.timeframeAligned ? "YES ✅" : "NO")}
+          ${metric("3-TF Aligned", tech.threeTimeframeAligned ? "YES ✅✅" : "NO")}
           ${metric("Confluence", tech.confluenceTotal ? `${tech.confluenceCount}/${tech.confluenceTotal} (${tech.confluenceDirection || "NEUTRAL"})` : "N/A")}
           ${metric("Nifty Trend", tech.marketBreadthTrend || "NEUTRAL")}
           ${metric("Daily EMA 20", `₹${formatNumber(data.technical?.dailyEma20)}`)}
           ${metric("Daily EMA 50", `₹${formatNumber(data.technical?.dailyEma50)}`)}
           ${metric("Daily RSI", formatNumber(data.technical?.dailyRsi))}
         </div>
-        ${tech.timeframeAligned
-          ? `<div class="reason" style="margin-top:10px"><strong>✅ Daily and intraday trend agree — higher-confidence setup.</strong></div>`
-          : `<div class="reason" style="margin-top:10px">⚠ Daily and intraday trend do not fully agree — treat as lower confidence.</div>`
+        ${tech.threeTimeframeAligned
+          ? `<div class="reason" style="margin-top:10px"><strong>✅✅ Weekly, daily and intraday all agree — highest-confidence setup.</strong></div>`
+          : tech.timeframeAligned
+            ? `<div class="reason" style="margin-top:10px"><strong>✅ Daily and intraday trend agree — higher-confidence setup.</strong></div>`
+            : `<div class="reason" style="margin-top:10px">⚠ Timeframes do not fully agree — treat as lower confidence.</div>`
         }
+      </div>
+
+      <div class="section-card">
+        <h3>🏭 Sector Relative Strength</h3>
+        ${sector.available ? `
+          <div class="tech-grid">
+            ${metric("Sector", sector.label || "N/A")}
+            ${metric("Sector Trend", sector.sectorTrend || "NEUTRAL")}
+            ${metric("Performance vs Sector", sector.performance || "N/A")}
+            ${metric("Relative Strength (20d)", sector.relativeStrength == null ? "N/A" : `${sector.relativeStrength >= 0 ? "+" : ""}${formatNumber(sector.relativeStrength)}%`)}
+          </div>
+        ` : `<div class="reason">Sector not identified for this stock, or sector index data unavailable right now.</div>`}
       </div>
 
       <div class="section-card">
@@ -536,6 +563,68 @@ function renderAnalysis(data) {
         Last analysis: ${escapeHtml(new Date(data.dataFreshness?.analysisGeneratedAt || Date.now()).toLocaleTimeString("en-IN"))}
       </div>
     </div>
+  `;
+
+  currentAnalysisData = data;
+  const capitalInput = document.getElementById("calcCapital");
+  const riskInput = document.getElementById("calcRisk");
+  if (capitalInput) capitalInput.value = calcCapitalValue;
+  if (riskInput) riskInput.value = calcRiskValue;
+  updatePositionSize();
+}
+
+// ============================================================
+// POSITION SIZE CALCULATOR
+// ============================================================
+
+let currentAnalysisData = null;
+let calcCapitalValue = "";
+let calcRiskValue = "1";
+
+function updatePositionSize() {
+  const box = document.getElementById("calcResult");
+  if (!box) return;
+
+  const capitalInput = document.getElementById("calcCapital");
+  const riskInput = document.getElementById("calcRisk");
+  calcCapitalValue = capitalInput ? capitalInput.value : calcCapitalValue;
+  calcRiskValue = riskInput ? riskInput.value : calcRiskValue;
+
+  const capital = Number(calcCapitalValue);
+  const riskPercent = Number(calcRiskValue);
+  const data = currentAnalysisData;
+
+  const entry = Number(data?.entry);
+  const stopLoss = Number(data?.stopLoss);
+
+  if (!capital || capital <= 0 || !riskPercent || riskPercent <= 0) {
+    box.innerHTML = `<div class="reason">Enter your capital and risk % to calculate position size.</div>`;
+    return;
+  }
+
+  if (!Number.isFinite(entry) || !Number.isFinite(stopLoss) || entry === stopLoss) {
+    box.innerHTML = `<div class="reason">No active trade levels right now (signal is WAIT) — position size needs an Entry and Stop Loss.</div>`;
+    return;
+  }
+
+  const riskPerShare = Math.abs(entry - stopLoss);
+  const riskAmount = capital * (riskPercent / 100);
+  let quantity = Math.floor(riskAmount / riskPerShare);
+  let capitalRequired = quantity * entry;
+
+  // Don't suggest more shares than the account can actually afford.
+  if (capitalRequired > capital && entry > 0) {
+    quantity = Math.floor(capital / entry);
+    capitalRequired = quantity * entry;
+  }
+
+  const actualRisk = quantity * riskPerShare;
+
+  box.innerHTML = `
+    ${metric("Suggested Quantity", quantity > 0 ? `${quantity} shares` : "0 (capital too low)")}
+    ${metric("Capital Required", `₹${formatNumber(capitalRequired)}`)}
+    ${metric("Max Loss (at SL)", `₹${formatNumber(actualRisk)}`)}
+    ${metric("Risk per Share", `₹${formatNumber(riskPerShare)}`)}
   `;
 }
 
