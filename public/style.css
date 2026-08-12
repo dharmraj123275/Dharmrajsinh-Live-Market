@@ -45,6 +45,10 @@ button{cursor:pointer}
 .tool-row{display:flex;gap:8px;margin-top:10px}
 .tool-btn{flex:1;border:1px solid #334155;border-radius:12px;padding:11px 10px;background:#1a2c47;color:#e2e8f0;font-weight:800;cursor:pointer}
 .tool-btn:active{opacity:.8}
+.calc-row{display:flex;gap:8px}
+.calc-field{flex:1;min-width:0}
+.calc-field span{display:block;font-size:10px;color:var(--muted);margin-bottom:4px}
+.calc-field input{width:100%;border:1px solid #334155;background:#f8fafc;color:#0f172a;border-radius:10px;padding:10px 11px;outline:none;box-sizing:border-box}
 .signal-pill{display:inline-block;padding:3px 8px;border-radius:999px;font-size:10px;font-weight:800;margin-left:5px}
 .signal-pill.buy{background:#052e1a;color:#22c55e}
 .signal-pill.sell{background:#2e0505;color:#ef4444}
