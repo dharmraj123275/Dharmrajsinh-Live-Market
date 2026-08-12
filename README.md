@@ -24,6 +24,10 @@ Mobile-first NSE + BSE equity analysis dashboard using the Upstox API.
 - Opening Range Breakout (ORB) detection and score input
 - Signal accuracy tracking (trade journal with auto win/loss tracking and win rate)
 - Market scanner across the local watchlist
+- 52-week high/low
+- Weekly timeframe with true 3-timeframe (weekly + daily + intraday) alignment
+- Sector relative strength (vs NIFTY sector index)
+- Position size calculator (capital + risk % → suggested quantity)
 - Technical confirmation
 - AI-style score and confidence
 - BUY / STRONG BUY / BREAKOUT BUY / WAIT / SELL / STRONG SELL / BREAKDOWN SELL / EXIT
@@ -75,6 +79,22 @@ The Upstox Market Data Feed V3 is the official streaming option if a true tick-b
 This version is an analysis/read-only dashboard. It does not place, modify or cancel orders.
 
 
+
+## V7.6.0 additions
+
+- **52-week High/Low**: daily candle fetch extended from 220 to 370 days; a new `fiftyTwoWeekRange()` shows where the stock sits relative to its yearly range.
+- **Weekly timeframe / true 3-timeframe alignment**: weekly candles (2 years) now feed a `buildWeeklyTrend()` (weekly EMA20/50, RSI, MACD). A STRONG BUY/SELL is now vetoed if the weekly structural trend directly contradicts the daily/intraday signal, and a new "3-TF Aligned" flag highlights when weekly + daily + intraday all agree — the highest-confidence setup this system can produce.
+- **Sector relative strength**: matches the stock's fundamentals sector (Banking, IT, Pharma, Auto, FMCG, Metal, Realty, Energy, Financial Services, Infra, Media) to its NIFTY sector index, and compares 20-day relative performance (OUTPERFORMING / IN_LINE / UNDERPERFORMING). A STRONG BUY is vetoed if the stock is meaningfully lagging a bullish sector; a STRONG SELL is vetoed if it's outperforming a bearish one.
+- **Position size calculator**: enter capital and risk % per trade in the analysis view, and it calculates suggested quantity, capital required, and max loss using the live entry/stop-loss levels.
+- **Not implemented — Delivery % and FII/DII flow**: verified against Upstox's own developer community that neither is available through their API (delivery data explicitly has no market-quote field; FII/DII is NSE-published, delayed, non-API data). Rather than fake this with unreliable scraping, it was left out — sector relative strength was added instead as a comparable, reliably-sourced signal.
+
+## V7.5.3 fixes and additions
+
+- **Critical fix**: the 4 dashboard index cards (NIFTY 50, SENSEX, MIDCPNIFTY, INDIA VIX) were using the same `ohlc.close`-mirrors-live-price bug that had already been fixed for individual stocks — `analyzeIndex()` now uses the same reliable `price - net_change` calculation, so index Previous Close and % change are now correct.
+- **Fixed Circuit Range showing ₹0.00 - ₹0.00**: when Upstox doesn't return circuit-limit data for an instrument, the UI now shows "N/A" instead of a fake zero range.
+- **Dashboard simplified**: the 4 index cards now show only symbol, price and change % — Open/High/Low/Prev Close/ATP were removed from the dashboard and are shown only inside the per-stock search/analysis view (added in V7.5.2), per request.
+- **New: circuit-limit proximity veto** — a STRONG BUY/SELL (and even a plain BUY/SELL) is no longer issued when price is pinned within 0.5% of its upper/lower circuit limit, since there's little room left to move and the stock can freeze mid-trade.
+- **New: data-sufficiency veto** — STRONG BUY/STRONG SELL now require at least 30 daily candles and 20 intraday candles before a strong grade is issued, so a thin/incomplete data sample can no longer produce an overconfident "strong" signal (falls back to a normal BUY/SELL grade instead).
 
 ## V7.5.2 additions
 
