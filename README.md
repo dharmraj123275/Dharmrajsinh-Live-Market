@@ -80,6 +80,31 @@ This version is an analysis/read-only dashboard. It does not place, modify or ca
 
 
 
+## V7.8 — Smart Money Concepts (SMC)
+
+Adds the same analysis framework as TradingView's "LuxAlgo - Smart Money Concepts" indicator — but wired directly into the actionable BUY/SELL signal instead of being a pure chart overlay:
+
+- **Market Structure (BOS/CHoCH)**: detects swing highs/lows and classifies the trend as bullish (higher highs + higher lows) or bearish (lower highs + lower lows). A break of a swing point in the direction of the existing structure is a BOS (continuation); a break against it is a CHoCH (Change of Character — a possible reversal).
+- **Order Blocks**: the last down-close candle before a strong bullish break (bullish order block), and the mirror for bearish — classic institutional-footprint zones.
+- **Fair Value Gaps (FVG)**: 3-candle imbalance zones where price skipped a range and often returns to "fill" it.
+- **Equal Highs/Lows**: liquidity pools where two swing points sit within a small % of each other.
+- **Premium/Discount Zones**: splits the recent swing range into Discount (bottom third — favorable buy zone), Equilibrium (middle), and Premium (top third — favorable sell zone).
+- **Wired into the signal engine**: a STRONG BUY is held back to a normal BUY if there's a bearish CHoCH against it or price is deep in the Premium zone (buying expensive); a STRONG SELL is similarly held back for a bullish CHoCH or a Discount zone. Structure, BOS/CHoCH and zone also contribute to the AI score.
+- New "🧠 Smart Money Concepts" card in the stock view; scanner results also show the current structure/zone.
+
+## V7.7 — critical fixes, speed, and UI cleanup
+
+- **Critical fix — server crash bug**: a duplicate `const weeklyTrend`/`fiftyTwoWeek` declaration would have crashed the server on startup (`SyntaxError: Identifier already declared`). Removed.
+- **Fixed entry/target/stop-loss being unrealistically far apart** (e.g. ₹721 entry with a ₹823 stop — a 14% risk distance): the level engine picks the tighter of the ATR-based stop vs. a stale 20-day support/resistance instead of the farther one, and a hard cap now limits risk distance to ~3.5% of price no matter what the underlying ATR/VIX data looks like.
+- **Fixed Circuit Range showing wrong values**: `getValidatedCircuitLimits()` now checks that the live price actually falls inside Upstox's returned circuit band (with a small tolerance); if it doesn't — a sign the data is stale or mismatched — it shows N/A instead of a wrong number.
+- **Speed — parallelized network calls**: intraday/daily/weekly candles now fetch concurrently instead of one after another; Nifty breadth, VIX, market depth, news and fundamentals also now run concurrently via `Promise.all` inside each stock analysis instead of sequentially.
+- **Speed — weekly candles cached separately for 1 hour**: previously re-fetched every 15s alongside intraday/daily even though weekly data barely changes — now cached far longer, cutting redundant network calls significantly.
+- **Speed — cache pre-warming**: Nifty breadth + VIX are now refreshed in the background every 25s (starting at server boot) so the first request after a cache expiry doesn't pay that latency — it's already warm.
+- **Speed — scanner**: pre-warms breadth/VIX once before scanning instead of letting concurrent stocks race to fetch the same shared data independently, and concurrency raised from 3 to 5.
+- **Speed — gzip compression** added for every response — JSON analysis payloads and static assets compress 70-85% smaller, which matters most on a slow mobile connection.
+- **UI simplified per request**: removed the "Volatility & Opening Range" card and the "Fundamental Analysis" card from the per-stock view. Both still feed the backend signal scoring exactly as before — only the separate detail cards are gone, so the UI stays focused on entry/target/stop-loss and the final signal.
+- **Position size calculator improved**: now shows sizing mode (risk-based vs. capital-limited), risk amount allowed, actual max loss, and % of capital deployed — and warns if risk % per trade is set unrealistically high (>10%).
+
 ## V7.6.0 additions
 
 - **52-week High/Low**: daily candle fetch extended from 220 to 370 days; a new `fiftyTwoWeekRange()` shows where the stock sits relative to its yearly range.
