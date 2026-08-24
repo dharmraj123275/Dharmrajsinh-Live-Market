@@ -1,5 +1,5 @@
 // ============================================================
-// DHARMRAJSINH LIVE MARKET V7.6
+// DHARMRAJSINH LIVE MARKET V7.8
 // COMPLETE SERVER.JS
 //
 // NSE + BSE EQUITY SCANNER
@@ -11,6 +11,7 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
+const compression = require("compression");
 const path = require("path");
 const fs = require("fs");
 
@@ -20,6 +21,10 @@ const upstox = require("./services/upstox.js");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Speed: gzip every response. JSON analysis payloads and the static JS/CSS
+// compress 70-85% smaller — a big win specifically on slow mobile
+// connections, which is exactly where this app is used live.
+app.use(compression());
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.join(__dirname, "public")));
@@ -36,6 +41,7 @@ const lastSignal = new Map();
 const indexCache = new Map();
 const marketBreadthCache = new Map();
 const vixCache = new Map();
+const weeklyCandleCache = new Map();
 
 const QUOTE_CACHE_MS = 2500;
 const TECH_CACHE_MS = 15000;
@@ -44,6 +50,7 @@ const NEWS_CACHE_MS = 2 * 60 * 1000;
 const INDEX_CACHE_MS = 2500;
 const BREADTH_CACHE_MS = 30000;
 const VIX_CACHE_MS = 30000;
+const WEEKLY_CACHE_MS = 60 * 60 * 1000; // weekly candles barely change intraday — cache 1 hour
 
 let runtimeAccessToken = String(process.env.UPSTOX_ACCESS_TOKEN || "").trim();
 let tokenCreatedAt = null;
@@ -231,6 +238,24 @@ function num(value, fallback = 0) {
 function round2(value) {
   const n = Number(value);
   return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0;
+}
+
+// Circuit limits are only meaningful if the current price actually falls
+// inside them — if Upstox returns a stale/mismatched band where the live
+// price sits outside [lower, upper], the data isn't trustworthy and
+// showing it would just be a different flavor of "wrong data".
+function getValidatedCircuitLimits(quote, price) {
+  const lower = num(quote?.lower_circuit_limit);
+  const upper = num(quote?.upper_circuit_limit);
+  const p = num(price);
+
+  if (!(lower > 0) || !(upper > 0) || !(upper > lower)) {
+    return { lowerCircuit: null, upperCircuit: null };
+  }
+  if (p > 0 && (p < lower * 0.98 || p > upper * 1.02)) {
+    return { lowerCircuit: null, upperCircuit: null };
+  }
+  return { lowerCircuit: round2(lower), upperCircuit: round2(upper) };
 }
 
 function clamp(value, min, max) {
@@ -639,47 +664,52 @@ async function getCandlePack(instrument) {
   const cached = cacheGet(technicalCache, instrument, TECH_CACHE_MS);
   if (cached) return cached;
 
-  let intraday = [];
-  let daily = [];
-
-  try {
-    intraday = await upstox.getIntradayCandles(instrument, "minutes", 1);
-  } catch (error) {
-    if (isUnauthorized(error)) throw error;
-  }
-
-  try {
-    daily = await upstox.getHistoricalCandles(
+  // Speed: intraday + daily + weekly are independent HTTP calls — fire them
+  // concurrently instead of one-by-one. Weekly barely changes intraday so
+  // it gets its own much longer-lived cache instead of being refetched on
+  // every 15s technical-cache cycle.
+  const [intradayResult, dailyResult, weeklyResult] = await Promise.allSettled([
+    upstox.getIntradayCandles(instrument, "minutes", 1),
+    upstox.getHistoricalCandles(
       instrument,
       "days",
       "1",
       indiaDateString(),
       dateMinusDays(370) // covers a full 52-week range for high/low + daily EMA50
-    );
-  } catch (error) {
-    if (isUnauthorized(error)) throw error;
+    ),
+    getWeeklyCandles(instrument)
+  ]);
+
+  for (const r of [intradayResult, dailyResult]) {
+    if (r.status === "rejected" && isUnauthorized(r.reason)) throw r.reason;
   }
 
-  let weekly = [];
+  const pack = {
+    intraday: normalizeCandles(intradayResult.status === "fulfilled" ? intradayResult.value : []),
+    daily: normalizeCandles(dailyResult.status === "fulfilled" ? dailyResult.value : []),
+    weekly: weeklyResult.status === "fulfilled" ? weeklyResult.value : []
+  };
+
+  return cacheSet(technicalCache, instrument, pack);
+}
+
+async function getWeeklyCandles(instrument) {
+  const cached = cacheGet(weeklyCandleCache, instrument, WEEKLY_CACHE_MS);
+  if (cached) return cached;
+
   try {
-    weekly = await upstox.getHistoricalCandles(
+    const weekly = await upstox.getHistoricalCandles(
       instrument,
       "weeks",
       "1",
       indiaDateString(),
       dateMinusDays(730) // ~2 years of weekly candles, enough for weekly EMA20/50
     );
+    return cacheSet(weeklyCandleCache, instrument, normalizeCandles(weekly));
   } catch (error) {
     if (isUnauthorized(error)) throw error;
+    return cacheSet(weeklyCandleCache, instrument, []);
   }
-
-  const pack = {
-    intraday: normalizeCandles(intraday),
-    daily: normalizeCandles(daily),
-    weekly: normalizeCandles(weekly)
-  };
-
-  return cacheSet(technicalCache, instrument, pack);
 }
 
 // ============================================================
@@ -1132,11 +1162,18 @@ async function getFundamentalAnalysis(instrument) {
 function calculateLevels({ price, support, resistance, atrValue, trend, technicalScore, depthTrend, vixMultiplier = 1 }) {
   // V7.4.2: Intraday-safe level engine.
   // Do not use a distant 20-day resistance as the immediate entry.
+  // V7.6.1 fix: the stop-loss calc had min/max reversed, so a far-away
+  // 20-day support/resistance could get picked as the stop instead of the
+  // tight ATR-based one — producing entry/target/stoploss that were
+  // realistically unusable for intraday trading. Fixed, and a hard cap was
+  // added so the risk distance can never exceed ~3.5% of price no matter
+  // what the underlying support/resistance/ATR data looks like.
   const p = num(price);
   const atr = Math.max(num(atrValue), p * 0.004) * vixMultiplier;
-  const risk = Math.max(atr * 0.8, p * 0.006 * vixMultiplier);
+  const rawRisk = Math.max(atr * 0.8, p * 0.006 * vixMultiplier);
+  const risk = Math.min(rawRisk, p * 0.035); // hard cap: max ~3.5% intraday risk
   const minGap = Math.max(p * 0.001, atr * 0.05);
-  const maxEntryDistance = Math.max(p * 0.006, atr * 0.75);
+  const maxEntryDistance = Math.min(Math.max(p * 0.006, atr * 0.75), p * 0.02);
 
   const s = num(support, p - risk);
   const r = num(resistance, p + risk * 1.5);
@@ -1146,42 +1183,40 @@ function calculateLevels({ price, support, resistance, atrValue, trend, technica
   const rawBreakout = r > p ? r + minGap : p + minGap;
   const buyEntry = p + Math.min(Math.max(rawBreakout - p, minGap), maxEntryDistance);
 
-  const buyStop = Math.max(0.01, Math.min(s, p - risk));
-  const safeBuyStop = buyStop >= buyEntry
-    ? Math.max(0.01, buyEntry - risk)
-    : buyStop;
+  // Stop must be the TIGHTER (closer-to-price) of the ATR-based level and
+  // support — not the farther one, otherwise a stale 20-day support far
+  // below price blows out the stop distance.
+  const buyStopCandidate = (s > 0 && s < buyEntry) ? Math.max(s, buyEntry - risk) : buyEntry - risk;
+  const safeBuyStop = Math.max(0.01, Math.min(buyStopCandidate, buyEntry - minGap));
   const buyRisk = Math.max(0.01, buyEntry - safeBuyStop);
 
   // Use a nearby resistance only when it provides a sensible reward.
   // Otherwise calculate targets from the actual intraday risk distance.
   const resistanceTarget = r > buyEntry ? r : 0;
   const buyTarget1 = resistanceTarget > buyEntry &&
-      (resistanceTarget - buyEntry) >= buyRisk * 1.5
+      (resistanceTarget - buyEntry) >= buyRisk * 1.5 &&
+      (resistanceTarget - buyEntry) <= buyRisk * 4
     ? resistanceTarget
     : buyEntry + buyRisk * 1.5;
-  const buyTarget2 = Math.max(
-    buyEntry + buyRisk * 2.0,
-    resistanceTarget > buyTarget1 ? resistanceTarget : 0
-  );
+  const buyTarget2 = buyEntry + buyRisk * 2.0;
 
   // Sell side: keep the trigger close to current price as well.
   const rawBreakdown = s < p ? s - minGap : p - minGap;
   const sellEntry = p - Math.min(Math.max(p - rawBreakdown, minGap), maxEntryDistance);
-  const sellStopBase = Math.max(sellEntry + risk, r);
-  const sellStop = sellStopBase <= sellEntry
-    ? sellEntry + risk
-    : sellStopBase;
+
+  // Same fix mirrored: stop is the TIGHTER (closer-to-price) of the
+  // ATR-based level and resistance — not the farther one.
+  const sellStopCandidate = (r > sellEntry) ? Math.min(r, sellEntry + risk) : sellEntry + risk;
+  const sellStop = Math.max(sellStopCandidate, sellEntry + minGap);
   const sellRisk = Math.max(0.01, sellStop - sellEntry);
 
   const supportTarget = s < sellEntry ? s : 0;
   const sellTarget1 = supportTarget > 0 &&
-      (sellEntry - supportTarget) >= sellRisk * 1.5
+      (sellEntry - supportTarget) >= sellRisk * 1.5 &&
+      (sellEntry - supportTarget) <= sellRisk * 4
     ? supportTarget
     : Math.max(0.01, sellEntry - sellRisk * 1.5);
-  const sellTarget2 = Math.min(
-    sellEntry - sellRisk * 2.0,
-    supportTarget > 0 && supportTarget < sellTarget1 ? supportTarget : sellEntry - sellRisk * 2.0
-  );
+  const sellTarget2 = Math.max(0.01, sellEntry - sellRisk * 2.0);
 
   const buyRR1 = (buyTarget1 - buyEntry) / buyRisk;
   const buyRR2 = (buyTarget2 - buyEntry) / buyRisk;
@@ -1233,7 +1268,8 @@ function buildSignal({
   lowerCircuit = null,
   upperCircuit = null,
   weeklyTrend = { available: false, trend: "NEUTRAL" },
-  sectorStrength = { available: false }
+  sectorStrength = { available: false },
+  smc = { available: false }
 }) {
   const p = num(price);
   const range = Math.max(num(high) - num(low), p * 0.001);
@@ -1290,6 +1326,19 @@ function buildSignal({
   const weeklyBullishOk = !weeklyTrend.available || weeklyTrendValue !== "BEARISH";
   const weeklyBearishOk = !weeklyTrend.available || weeklyTrendValue !== "BULLISH";
 
+  // Smart Money Concepts (order blocks / BOS-CHoCH / premium-discount).
+  // A CHoCH (structure reversal) against the trade direction, or trying to
+  // buy deep in a Premium zone / sell deep in a Discount zone, is a
+  // classically weak SMC entry — hold STRONG grades back in that case,
+  // while still allowing a normal BUY/SELL (SMC augments, doesn't replace,
+  // the core technical signal).
+  const smcStructure = smc.available ? smc.structure : "NEUTRAL";
+  const smcEventDirection = smc.available && smc.lastEvent ? smc.lastEvent.direction : "NEUTRAL";
+  const smcEventType = smc.available && smc.lastEvent ? smc.lastEvent.type : null;
+  const smcZone = smc.available ? smc.premiumDiscount.zone : "UNKNOWN";
+  const smcBullishOk = !(smc.available && ((smcEventType === "CHoCH" && smcEventDirection === "BEARISH") || smcZone === "PREMIUM"));
+  const smcBearishOk = !(smc.available && ((smcEventType === "CHoCH" && smcEventDirection === "BULLISH") || smcZone === "DISCOUNT"));
+
   const aiScore = Math.round(clamp(
     50 +
       technicalScore * 0.25 +
@@ -1300,7 +1349,10 @@ function buildSignal({
       (timeframeAligned ? (technicalData.dailyTrend === "BULLISH" ? 6 : -6) : 0) +
       (orbBias === "BULLISH" ? 6 : orbBias === "BEARISH" ? -6 : 0) +
       (threeTimeframeAligned ? (weeklyTrendValue === "BULLISH" ? 8 : -8) : 0) +
-      (sectorStrength.available ? (sectorStrength.relativeStrength > 0 ? Math.min(sectorStrength.relativeStrength, 8) : Math.max(sectorStrength.relativeStrength, -8)) * 0.5 : 0),
+      (sectorStrength.available ? (sectorStrength.relativeStrength > 0 ? Math.min(sectorStrength.relativeStrength, 8) : Math.max(sectorStrength.relativeStrength, -8)) * 0.5 : 0) +
+      (smcStructure === "BULLISH" ? 5 : smcStructure === "BEARISH" ? -5 : 0) +
+      (smcEventType === "BOS" ? (smcEventDirection === "BULLISH" ? 4 : -4) : smcEventType === "CHoCH" ? (smcEventDirection === "BULLISH" ? 6 : -6) : 0) +
+      (smcZone === "DISCOUNT" ? 4 : smcZone === "PREMIUM" ? -4 : 0),
     0,
     100
   ));
@@ -1362,6 +1414,7 @@ function buildSignal({
     dataSufficient &&
     weeklyBullishOk &&
     sectorBullishOk &&
+    smcBullishOk &&
     (technicalData.confluenceTotal == null || confluenceDirection !== "BEARISH") &&
     levels.buyRR1 >= 1.5;
 
@@ -1388,6 +1441,7 @@ function buildSignal({
     dataSufficient &&
     weeklyBearishOk &&
     sectorBearishOk &&
+    smcBearishOk &&
     (technicalData.confluenceTotal == null || confluenceDirection !== "BULLISH") &&
     levels.sellRR1 >= 1.5;
 
@@ -1557,6 +1611,11 @@ function buildSignal({
       sectorPerformance: sectorStrength.performance || "NEUTRAL",
       sectorRelativeStrength: sectorStrength.relativeStrength ?? null,
       sectorAvailable: Boolean(sectorStrength.available),
+      smcAvailable: Boolean(smc.available),
+      smcStructure,
+      smcEventType,
+      smcEventDirection,
+      smcZone,
       buyersConfirmed: depth.buyersConfirmed,
       sellersConfirmed: depth.sellersConfirmed,
       confirmationStatus
@@ -1632,10 +1691,18 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
 
   const weeklyTrend = technical.buildWeeklyTrend(weekly, price);
   const fiftyTwoWeek = technical.fiftyTwoWeekRange(daily);
-
-  const marketBreadth = await getMarketBreadth();
-  const vix = await getVixLevel();
   const orb = calculateORB(intraday);
+  const smc = technical.buildSmartMoneyConcepts(daily, price);
+
+  // Speed: these 4 network-dependent lookups are all independent of each
+  // other — run them concurrently instead of one-by-one to cut total
+  // wait time roughly to the slowest single call instead of the sum.
+  const [marketBreadth, vix, depth, [news, fundamentals]] = await Promise.all([
+    getMarketBreadth(),
+    getVixLevel(),
+    Promise.resolve(buildDepth(quote)),
+    Promise.all([getNewsAnalysis(instrument), getFundamentalAnalysis(instrument)])
+  ]);
 
   const recentDaily = daily.slice(-20);
   const recentHigh = recentDaily.length
@@ -1648,14 +1715,10 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
   const support = Math.min(low || recentLow, recentLow || low || price);
   const resistance = Math.max(high || recentHigh, recentHigh || high || price);
 
-  const depth = buildDepth(quote);
-
-  const [news, fundamentals] = await Promise.all([
-    getNewsAnalysis(instrument),
-    getFundamentalAnalysis(instrument)
-  ]);
-
+  // Sector strength needs fundamentals.sector, so it runs after the block above.
   const sectorStrength = await getSectorStrength(fundamentals.sector, daily);
+
+  const circuitLimits = getValidatedCircuitLimits(quote, price);
 
   const levels = calculateLevels({
     price,
@@ -1687,8 +1750,9 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
     orb,
     weeklyTrend,
     sectorStrength,
-    lowerCircuit: quote.lower_circuit_limit > 0 ? num(quote.lower_circuit_limit) : null,
-    upperCircuit: quote.upper_circuit_limit > 0 ? num(quote.upper_circuit_limit) : null
+    smc,
+    lowerCircuit: circuitLimits.lowerCircuit,
+    upperCircuit: circuitLimits.upperCircuit
   });
 
   const lastTradeTime = quote.last_trade_time
@@ -1712,8 +1776,8 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
     averageTradePrice: round2(quote.average_price),
     volume: num(quote.volume),
     oi: num(quote.oi),
-    lowerCircuit: quote.lower_circuit_limit > 0 ? round2(quote.lower_circuit_limit) : null,
-    upperCircuit: quote.upper_circuit_limit > 0 ? round2(quote.upper_circuit_limit) : null,
+    lowerCircuit: circuitLimits.lowerCircuit,
+    upperCircuit: circuitLimits.upperCircuit,
     lastTradeTime,
     support: round2(support),
     resistance: round2(resistance),
@@ -1761,6 +1825,23 @@ async function analyzeInstrument({ instrument, symbol = "", name = "", exchange 
       available: fiftyTwoWeek.available
     },
     sectorStrength,
+    smc: smc.available ? {
+      available: true,
+      structure: smc.structure,
+      lastEvent: smc.lastEvent,
+      bullishOB: smc.bullishOB ? { high: round2(smc.bullishOB.high), low: round2(smc.bullishOB.low), timestamp: smc.bullishOB.timestamp } : null,
+      bearishOB: smc.bearishOB ? { high: round2(smc.bearishOB.high), low: round2(smc.bearishOB.low), timestamp: smc.bearishOB.timestamp } : null,
+      nearestBullishFVG: smc.nearestBullishFVG ? { top: round2(smc.nearestBullishFVG.top), bottom: round2(smc.nearestBullishFVG.bottom) } : null,
+      nearestBearishFVG: smc.nearestBearishFVG ? { top: round2(smc.nearestBearishFVG.top), bottom: round2(smc.nearestBearishFVG.bottom) } : null,
+      equalHigh: smc.equalHigh ? round2(smc.equalHigh.level) : null,
+      equalLow: smc.equalLow ? round2(smc.equalLow.level) : null,
+      premiumDiscount: {
+        zone: smc.premiumDiscount.zone,
+        percent: smc.premiumDiscount.percent,
+        swingHigh: round2(smc.premiumDiscount.swingHigh),
+        swingLow: round2(smc.premiumDiscount.swingLow)
+      }
+    } : { available: false },
     marketDepth: depth,
     news,
     fundamentals,
@@ -1860,7 +1941,13 @@ app.get("/api/scanner", async (req, res) => {
   const onlyActionable = req.query.all !== "true";
 
   try {
-    const raw = await runWithConcurrency(watchlist, 3, async (stock) => {
+    // Speed: pre-warm the shared caches (Nifty breadth, VIX) once before the
+    // scan starts. Without this, the first 2-3 concurrent stocks would each
+    // race to fetch the same breadth/VIX data independently since none of
+    // them see a warm cache yet — wasteful duplicate network calls.
+    await Promise.all([getMarketBreadth(), getVixLevel()]);
+
+    const raw = await runWithConcurrency(watchlist, 5, async (stock) => {
       const data = await analyzeInstrument({
         instrument: stock.instrument,
         symbol: stock.symbol,
@@ -1881,7 +1968,9 @@ app.get("/api/scanner", async (req, res) => {
         target1: data.target1,
         stopLoss: data.stopLoss,
         riskReward: data.riskReward,
-        trend: data.trend
+        trend: data.trend,
+        smcStructure: data.smc?.structure || "NEUTRAL",
+        smcZone: data.smc?.premiumDiscount?.zone || "UNKNOWN"
       };
     });
 
@@ -2116,7 +2205,7 @@ app.get("/api/health", (req, res) => {
   res.json({
     success: true,
     app: "Dharmrajsinh Live Market",
-    version: "7.6.0",
+    version: "7.8.0",
     serverTime: new Date().toISOString(),
     marketOpen: marketOpenNow(),
     upstoxToken: hasAccessToken() ? "AVAILABLE" : "MISSING",
@@ -2142,6 +2231,7 @@ app.get("/api/health", (req, res) => {
       "Weekly Timeframe (3-TF Alignment)",
       "Sector Relative Strength",
       "Position Size Calculator",
+      "Smart Money Concepts (Order Blocks, BOS/CHoCH, FVG, Premium/Discount)",
       "Fundamental Analysis",
       "News Impact",
       "Auto-Retry on API Failures",
@@ -2178,7 +2268,7 @@ app.use((error, req, res, next) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("================================================");
-  console.log("DHARMRAJSINH LIVE MARKET V7.6");
+  console.log("DHARMRAJSINH LIVE MARKET V7.8");
   console.log("================================================");
   console.log(`Server running on port ${PORT}`);
   console.log(`Upstox token: ${hasAccessToken() ? "AVAILABLE" : "MISSING"}`);
@@ -2194,4 +2284,17 @@ app.listen(PORT, "0.0.0.0", () => {
     }
   }, 60000);
   journalInterval.unref();
+
+  // Speed: keep Nifty breadth + VIX warm in the background so the first
+  // stock analysis after a cache expiry doesn't have to pay that latency —
+  // it's already sitting in cache by the time a request arrives.
+  const warmCaches = () => {
+    if (hasAccessToken()) {
+      getMarketBreadth().catch(() => {});
+      getVixLevel().catch(() => {});
+    }
+  };
+  warmCaches();
+  const warmInterval = setInterval(warmCaches, 25000);
+  warmInterval.unref();
 });
