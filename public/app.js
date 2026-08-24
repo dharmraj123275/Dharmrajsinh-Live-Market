@@ -357,6 +357,7 @@ function renderAnalysis(data) {
   const depth = data.marketDepth || {};
   const tech = data.technicalConfirmation || {};
   const sector = data.sectorStrength || {};
+  const smc = data.smc || {};
   const fundamentals = data.fundamentals || {};
   const news = data.news || {};
 
@@ -372,11 +373,6 @@ function renderAnalysis(data) {
       </div>
     `).join("")
     : `<div class="reason">No recent instrument news available.</div>`;
-
-  const ratioEntries = Object.entries(fundamentals.ratios || {}).slice(0, 6);
-  const ratioHtml = ratioEntries.length
-    ? ratioEntries.map(([key, value]) => metric(key, `${value.company ?? "—"} / Sector ${value.sector ?? "—"}`)).join("")
-    : metric("Fundamental Score", fundamentals.available ? `${fundamentals.score}/100` : "Unavailable");
 
   result.innerHTML = `
     <div class="analysis-card">
@@ -522,26 +518,24 @@ function renderAnalysis(data) {
       </div>
 
       <div class="section-card">
-        <h3>🌡 Volatility &amp; Opening Range</h3>
-        <div class="tech-grid">
-          ${metric("India VIX", tech.vixValue == null ? "N/A" : formatNumber(tech.vixValue))}
-          ${metric("Volatility", tech.vixLevel || "NORMAL")}
-          ${metric("ORB High", tech.orbHigh == null ? "N/A" : `₹${formatNumber(tech.orbHigh)}`)}
-          ${metric("ORB Low", tech.orbLow == null ? "N/A" : `₹${formatNumber(tech.orbLow)}`)}
-          ${metric("ORB Bias", tech.orbAvailable ? (tech.orbBias || "NEUTRAL") : "NOT FORMED YET")}
-        </div>
-      </div>
-
-      <div class="section-card">
-        <h3>🏢 Fundamental Analysis</h3>
-        <div class="two-col">
-          ${metric("Fundamental Score", fundamentals.available ? `${formatNumber(fundamentals.score)}/100` : "Unavailable")}
-          ${metric("Rating", fundamentals.rating || "UNAVAILABLE")}
-          ${metric("Sector", fundamentals.sector || "—")}
-          ${metric("ISIN", fundamentals.isin || selected?.isin || "—")}
-        </div>
-        <div class="grid" style="padding:10px 0 0">${ratioHtml}</div>
-        ${fundamentals.highlights?.length ? `<div class="reason">${escapeHtml(fundamentals.highlights.join(" • "))}</div>` : ""}
+        <h3>🧠 Smart Money Concepts</h3>
+        ${smc.available ? `
+          <div class="tech-grid">
+            ${metric("Market Structure", smc.structure || "NEUTRAL")}
+            ${metric("Last Structure Break", smc.lastEvent ? `${smc.lastEvent.type} (${smc.lastEvent.direction})` : "None yet")}
+            ${metric("Zone", smc.premiumDiscount?.zone || "UNKNOWN")}
+            ${metric("Zone Position", smc.premiumDiscount?.percent == null ? "N/A" : `${formatNumber(smc.premiumDiscount.percent)}%`)}
+            ${metric("Bullish Order Block", smc.bullishOB ? `₹${formatNumber(smc.bullishOB.low)} - ₹${formatNumber(smc.bullishOB.high)}` : "None found")}
+            ${metric("Bearish Order Block", smc.bearishOB ? `₹${formatNumber(smc.bearishOB.low)} - ₹${formatNumber(smc.bearishOB.high)}` : "None found")}
+            ${metric("Bullish FVG", smc.nearestBullishFVG ? `₹${formatNumber(smc.nearestBullishFVG.bottom)} - ₹${formatNumber(smc.nearestBullishFVG.top)}` : "None found")}
+            ${metric("Bearish FVG", smc.nearestBearishFVG ? `₹${formatNumber(smc.nearestBearishFVG.bottom)} - ₹${formatNumber(smc.nearestBearishFVG.top)}` : "None found")}
+            ${metric("Equal Highs", smc.equalHigh == null ? "None" : `₹${formatNumber(smc.equalHigh)}`)}
+            ${metric("Equal Lows", smc.equalLow == null ? "None" : `₹${formatNumber(smc.equalLow)}`)}
+          </div>
+          ${smc.lastEvent?.type === "CHoCH" ? `<div class="reason" style="margin-top:10px">⚠ Change of Character detected — possible trend reversal in progress, treat new signals with extra caution.</div>` : ""}
+          ${smc.premiumDiscount?.zone === "PREMIUM" ? `<div class="reason" style="margin-top:10px">Price is in the Premium zone (expensive relative to recent range) — better zone to sell/book profit than to chase a fresh buy.</div>` : ""}
+          ${smc.premiumDiscount?.zone === "DISCOUNT" ? `<div class="reason" style="margin-top:10px">Price is in the Discount zone (cheap relative to recent range) — favorable zone for a buy entry.</div>` : ""}
+        ` : `<div class="reason">Not enough daily candle history yet to map market structure.</div>`}
       </div>
 
       <div class="section-card">
@@ -602,6 +596,11 @@ function updatePositionSize() {
     return;
   }
 
+  if (riskPercent > 10) {
+    box.innerHTML = `<div class="reason">⚠ ${formatNumber(riskPercent)}% risk per trade is very high (1-2% is standard). Lower it for a realistic position size.</div>`;
+    return;
+  }
+
   if (!Number.isFinite(entry) || !Number.isFinite(stopLoss) || entry === stopLoss) {
     box.innerHTML = `<div class="reason">No active trade levels right now (signal is WAIT) — position size needs an Entry and Stop Loss.</div>`;
     return;
@@ -611,19 +610,26 @@ function updatePositionSize() {
   const riskAmount = capital * (riskPercent / 100);
   let quantity = Math.floor(riskAmount / riskPerShare);
   let capitalRequired = quantity * entry;
+  let sizingMode = "Risk-based";
 
-  // Don't suggest more shares than the account can actually afford.
+  // Don't suggest more shares than the account can actually afford —
+  // capital availability can be the tighter constraint than risk %.
   if (capitalRequired > capital && entry > 0) {
     quantity = Math.floor(capital / entry);
     capitalRequired = quantity * entry;
+    sizingMode = "Capital-limited";
   }
 
   const actualRisk = quantity * riskPerShare;
+  const capitalUsedPercent = capital > 0 ? (capitalRequired / capital) * 100 : 0;
 
   box.innerHTML = `
     ${metric("Suggested Quantity", quantity > 0 ? `${quantity} shares` : "0 (capital too low)")}
+    ${metric("Sizing Mode", sizingMode)}
     ${metric("Capital Required", `₹${formatNumber(capitalRequired)}`)}
-    ${metric("Max Loss (at SL)", `₹${formatNumber(actualRisk)}`)}
+    ${metric("Capital Used", `${formatNumber(capitalUsedPercent)}%`)}
+    ${metric("Risk Allowed", `₹${formatNumber(riskAmount)}`)}
+    ${metric("Actual Max Loss", `₹${formatNumber(actualRisk)}`)}
     ${metric("Risk per Share", `₹${formatNumber(riskPerShare)}`)}
   `;
 }
@@ -663,7 +669,7 @@ async function runScanner() {
               <strong>${escapeHtml(r.symbol)}</strong>
               <span class="signal-pill ${signalClass(r.signal)}">${escapeHtml(r.signal)}</span>
               <div>${escapeHtml(r.name)} • ₹${formatNumber(r.price)}</div>
-              <small>AI Score ${formatNumber(r.aiScore, 0)}/100 • R:R 1:${formatNumber(r.riskReward)}</small>
+              <small>AI Score ${formatNumber(r.aiScore, 0)}/100 • R:R 1:${formatNumber(r.riskReward)} • ${escapeHtml(r.smcZone || "")}</small>
             </div>
             <button class="analyze-btn" onclick='selectScannerStock(${JSON.stringify(r).replace(/'/g, "&#39;")})'>
               📊 View
