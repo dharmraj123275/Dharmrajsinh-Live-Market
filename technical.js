@@ -554,6 +554,220 @@ function fiftyTwoWeekRange(dailyCandles) {
   return { high, low, available: true, candleCount: daily.length };
 }
 
+// ============================================================
+// SMART MONEY CONCEPTS (SMC)
+// Order Blocks, market structure (BOS/CHoCH), Fair Value Gaps, Equal
+// High/Low liquidity, and Premium/Discount zones — the same framework
+// LuxAlgo's "Smart Money Concepts" indicator draws on a chart. Unlike a
+// chart overlay, this feeds directly into the BUY/SELL signal engine as
+// additional confirmation instead of being purely visual.
+// ------------------------------------------------------------
+
+// A swing high/low is a candle whose high/low is the most extreme within
+// `bars` candles on either side of it — the standard pivot definition.
+function findSwingPoints(candles, bars = 3) {
+  const highs = [];
+  const lows = [];
+
+  for (let i = bars; i < candles.length - bars; i++) {
+    const window = candles.slice(i - bars, i + bars + 1);
+    const windowHighs = window.map(c => c.high);
+    const windowLows = window.map(c => c.low);
+
+    if (candles[i].high === Math.max(...windowHighs)) {
+      highs.push({ index: i, price: candles[i].high, timestamp: candles[i].timestamp });
+    }
+    if (candles[i].low === Math.min(...windowLows)) {
+      lows.push({ index: i, price: candles[i].low, timestamp: candles[i].timestamp });
+    }
+  }
+
+  return { highs, lows };
+}
+
+// Walks the alternating sequence of swing highs/lows to classify the
+// market structure as bullish (higher highs + higher lows), bearish
+// (lower highs + lower lows), or neutral — then checks whether the
+// latest close has broken the most recent swing point. A break in the
+// same direction as the prevailing structure is a BOS (continuation);
+// a break against it is a CHoCH (potential reversal).
+function buildMarketStructure(candles) {
+  if (candles.length < 20) return { available: false };
+
+  const swings = findSwingPoints(candles, 3);
+  const points = [
+    ...swings.highs.map(s => ({ ...s, type: "H" })),
+    ...swings.lows.map(s => ({ ...s, type: "L" }))
+  ].sort((a, b) => a.index - b.index);
+
+  // Collapse consecutive same-type swings, keeping the more extreme one,
+  // so the sequence alternates H/L/H/L as true market structure does.
+  const alternating = [];
+  for (const p of points) {
+    const last = alternating[alternating.length - 1];
+    if (!last) { alternating.push(p); continue; }
+    if (last.type === p.type) {
+      if (p.type === "H" && p.price > last.price) alternating[alternating.length - 1] = p;
+      if (p.type === "L" && p.price < last.price) alternating[alternating.length - 1] = p;
+    } else {
+      alternating.push(p);
+    }
+  }
+
+  if (alternating.length < 4) return { available: false };
+
+  const recentHighs = alternating.filter(p => p.type === "H").slice(-2);
+  const recentLows = alternating.filter(p => p.type === "L").slice(-2);
+
+  let structure = "NEUTRAL";
+  if (recentHighs.length === 2 && recentLows.length === 2) {
+    const higherHighs = recentHighs[1].price > recentHighs[0].price;
+    const higherLows = recentLows[1].price > recentLows[0].price;
+    const lowerHighs = recentHighs[1].price < recentHighs[0].price;
+    const lowerLows = recentLows[1].price < recentLows[0].price;
+    if (higherHighs && higherLows) structure = "BULLISH";
+    else if (lowerHighs && lowerLows) structure = "BEARISH";
+  }
+
+  const lastSwingHigh = alternating.filter(p => p.type === "H").at(-1) || null;
+  const lastSwingLow = alternating.filter(p => p.type === "L").at(-1) || null;
+  const latestClose = candles.at(-1).close;
+
+  let lastEvent = null;
+  if (lastSwingHigh && latestClose > lastSwingHigh.price) {
+    lastEvent = { type: structure === "BEARISH" ? "CHoCH" : "BOS", direction: "BULLISH", level: lastSwingHigh.price };
+  } else if (lastSwingLow && latestClose < lastSwingLow.price) {
+    lastEvent = { type: structure === "BULLISH" ? "CHoCH" : "BOS", direction: "BEARISH", level: lastSwingLow.price };
+  }
+
+  return {
+    available: true,
+    structure,
+    lastEvent,
+    lastSwingHigh,
+    lastSwingLow,
+    swingPoints: alternating.slice(-8)
+  };
+}
+
+// Bullish OB: the last down-close candle before a strong up move that
+// closes above its high (institutional buying footprint). Bearish OB:
+// mirror image. Scans backward from the most recent candle so the
+// nearest (most relevant) unmitigated block is returned.
+function detectOrderBlocks(candles) {
+  let bullishOB = null;
+  let bearishOB = null;
+
+  for (let i = candles.length - 2; i >= 1; i--) {
+    const c = candles[i];
+    const next = candles[i + 1];
+    const isDown = c.close < c.open;
+    const isUp = c.close > c.open;
+
+    if (!bullishOB && isDown && next.close > c.high) {
+      bullishOB = { high: c.high, low: c.low, timestamp: c.timestamp };
+    }
+    if (!bearishOB && isUp && next.close < c.low) {
+      bearishOB = { high: c.high, low: c.low, timestamp: c.timestamp };
+    }
+    if (bullishOB && bearishOB) break;
+  }
+
+  return { bullishOB, bearishOB };
+}
+
+// A 3-candle imbalance: candle 1's high sits below candle 3's low
+// (bullish gap) or candle 1's low sits above candle 3's high (bearish
+// gap) — price skipped over that zone and often returns to "fill" it.
+function detectFairValueGaps(candles, lookback = 40) {
+  const recent = candles.slice(-lookback);
+  const gaps = [];
+
+  for (let i = 2; i < recent.length; i++) {
+    const c1 = recent[i - 2];
+    const c3 = recent[i];
+    if (c1.high < c3.low) {
+      gaps.push({ type: "BULLISH", top: c3.low, bottom: c1.high, timestamp: c3.timestamp });
+    } else if (c1.low > c3.high) {
+      gaps.push({ type: "BEARISH", top: c1.low, bottom: c3.high, timestamp: c3.timestamp });
+    }
+  }
+
+  return gaps.slice(-5);
+}
+
+// Two swing points of the same type within a small % of each other mark
+// a liquidity pool — a magnet for price since stop-losses cluster there.
+function detectEqualHighLow(swingPoints, thresholdPercent = 0.25) {
+  const highs = swingPoints.filter(p => p.type === "H");
+  const lows = swingPoints.filter(p => p.type === "L");
+
+  let equalHigh = null;
+  for (let i = highs.length - 1; i > 0; i--) {
+    const diff = Math.abs(highs[i].price - highs[i - 1].price) / highs[i - 1].price * 100;
+    if (diff <= thresholdPercent) { equalHigh = { level: (highs[i].price + highs[i - 1].price) / 2 }; break; }
+  }
+
+  let equalLow = null;
+  for (let i = lows.length - 1; i > 0; i--) {
+    const diff = Math.abs(lows[i].price - lows[i - 1].price) / lows[i - 1].price * 100;
+    if (diff <= thresholdPercent) { equalLow = { level: (lows[i].price + lows[i - 1].price) / 2 }; break; }
+  }
+
+  return { equalHigh, equalLow };
+}
+
+// Splits the recent swing range into Discount (bottom third — a "buy
+// zone" in SMC terms), Equilibrium (middle third), and Premium (top
+// third — a "sell zone").
+function calculatePremiumDiscountZone(swingHigh, swingLow, price) {
+  if (swingHigh == null || swingLow == null || swingHigh <= swingLow) {
+    return { zone: "UNKNOWN", percent: null, swingHigh: null, swingLow: null };
+  }
+  const range = swingHigh - swingLow;
+  const percent = ((num(price) - swingLow) / range) * 100;
+  let zone = "EQUILIBRIUM";
+  if (percent >= 70) zone = "PREMIUM";
+  else if (percent <= 30) zone = "DISCOUNT";
+  return { zone, percent: Math.round(percent * 100) / 100, swingHigh, swingLow };
+}
+
+function buildSmartMoneyConcepts(candles, price) {
+  const normalized = normalizeCandles(candles);
+  if (normalized.length < 20) return { available: false };
+
+  const structureData = buildMarketStructure(normalized);
+  const { bullishOB, bearishOB } = detectOrderBlocks(normalized);
+  const fvgs = detectFairValueGaps(normalized);
+
+  const swings = findSwingPoints(normalized, 3);
+  const points = [
+    ...swings.highs.map(s => ({ ...s, type: "H" })),
+    ...swings.lows.map(s => ({ ...s, type: "L" }))
+  ].sort((a, b) => a.index - b.index);
+  const { equalHigh, equalLow } = detectEqualHighLow(points);
+
+  const recentHighs = swings.highs.slice(-5).map(s => s.price);
+  const recentLows = swings.lows.slice(-5).map(s => s.price);
+  const rangeHigh = recentHighs.length ? Math.max(...recentHighs) : null;
+  const rangeLow = recentLows.length ? Math.min(...recentLows) : null;
+  const premiumDiscount = calculatePremiumDiscountZone(rangeHigh, rangeLow, price);
+
+  return {
+    available: true,
+    structure: structureData.available ? structureData.structure : "NEUTRAL",
+    lastEvent: structureData.available ? structureData.lastEvent : null,
+    bullishOB,
+    bearishOB,
+    fairValueGaps: fvgs,
+    nearestBullishFVG: fvgs.filter(g => g.type === "BULLISH").at(-1) || null,
+    nearestBearishFVG: fvgs.filter(g => g.type === "BEARISH").at(-1) || null,
+    equalHigh,
+    equalLow,
+    premiumDiscount
+  };
+}
+
 module.exports = {
   ema,
   emaSeries,
@@ -571,5 +785,12 @@ module.exports = {
   buildTechnical,
   buildMultiTimeframeTechnical,
   buildWeeklyTrend,
-  fiftyTwoWeekRange
+  fiftyTwoWeekRange,
+  buildSmartMoneyConcepts,
+  findSwingPoints,
+  buildMarketStructure,
+  detectOrderBlocks,
+  detectFairValueGaps,
+  detectEqualHighLow,
+  calculatePremiumDiscountZone
 };
